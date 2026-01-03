@@ -3,7 +3,7 @@
 [![Language](https://img.shields.io/badge/language-English-orange.svg)](./README.md)
 [![Language](https://img.shields.io/badge/language-Korean-blue.svg)](./README_KR.md)
 
-This repository contains the official implementation and experimental code for the paper **"Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs"** accepted at **TRUST-AI (ECAI 2025)**.
+This repository contains the official implementation and experimental code for the paper **"Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs."**
 
 We propose a novel two-step framework for **ACGAN (Auxiliary Classifier GAN)** to selectively remove specific class data from a trained model. Instead of directly modifying the generator, our approach intentionally weakens the discriminator's ability to recognize the target class and uses this "confused" feedback to guide the generator. This effectively mitigates **catastrophic forgetting** while achieving unlearning performance comparable to retraining from scratch.
 
@@ -107,12 +107,10 @@ python evaluate_inversion.py
 If you use this code, please cite our paper:
 
 ```bibtex
-@inproceedings{lee2025discriminator,
+@article{lee2025discriminator,
   title={Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs},
   author={Lee, Byeongcheon and Kim, Sangmin and Park, Sungwoo and Rho, Seungmin and Lee, Mi Young},
-  booktitle={TRUST-AI: The European Workshop on Trustworthy AI (ECAI 2025)},
-  year={2025},
-  organization={European Conference of Artificial Intelligence}
+  year={2025}
 }
 ```
 
@@ -135,4 +133,4 @@ This technology is patent pending with the Korean Intellectual Property Office (
 This project is licensed under the **Creative Commons Attribution 4.0 International License (CC BY 4.0)**.
 
 *   **Copyright**: Byeongcheon Lee, Sangmin Kim, Sungwoo Park, Seungmin Rho, Mi Young Lee
-*   **Source**: TRUST-AI @ ECAI 2025
+*   **Source**: Discriminator-Guided Unlearning (2025)

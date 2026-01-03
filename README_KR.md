@@ -3,7 +3,7 @@
 [![Language](https://img.shields.io/badge/language-English-orange.svg)](./README.md)
 [![Language](https://img.shields.io/badge/language-Korean-blue.svg)](./README_KR.md)
 
-본 리포지토리는 **TRUST-AI (ECAI 2025)** 워크샵에 채택된 논문 **"Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs"**의 공식 구현체 및 실험 코드를 포함함.
+본 리포지토리는 논문 **"Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs"**의 공식 구현체 및 실험 코드를 포함함.
 
 본 연구는 **ACGAN (Auxiliary Classifier GAN)** 모델에서 특정 클래스 데이터를 선택적으로 삭제(Unlearning)하기 위한 새로운 2단계 프레임워크를 제안함. 생성자(Generator)를 직접 수정하는 대신, 판별자(Discriminator)의 능력을 의도적으로 약화시키고 그 피드백을 통해 생성자를 유도하는 방식을 사용함. 이를 통해 **재학습(Retraining)** 수준의 망각 성능을 달성하면서도 **치명적 망각(Catastrophic Forgetting)** 문제를 효과적으로 완화함.
 
@@ -78,12 +78,10 @@ torchrun --standalone --nproc_per_node=2 train.py
 본 코드를 연구에 활용할 경우, 아래 논문을 인용 바람.
 
 ```bibtex
-@inproceedings{lee2025discriminator,
+@article{lee2025discriminator,
   title={Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs},
   author={Lee, Byeongcheon and Kim, Sangmin and Park, Sungwoo and Rho, Seungmin and Lee, Mi Young},
-  booktitle={TRUST-AI: The European Workshop on Trustworthy AI (ECAI 2025)},
-  year={2025},
-  organization={European Conference of Artificial Intelligence}
+  year={2025}
 }
 ```
 
@@ -107,4 +105,4 @@ torchrun --standalone --nproc_per_node=2 train.py
 이 프로젝트는 **Creative Commons Attribution 4.0 International License (CC BY 4.0)**에 따라 라이선스가 부여됨.
 
 *   **저작권자**: 이병천, 김상민, 박성우, 노승민, 이미영
-*   **출처**: TRUST-AI @ ECAI 2025
+*   **출처**: Discriminator-Guided Unlearning (2025)
