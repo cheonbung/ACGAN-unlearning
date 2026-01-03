@@ -3,79 +3,108 @@
 [![Language](https://img.shields.io/badge/language-English-orange.svg)](./README.md)
 [![Language](https://img.shields.io/badge/language-Korean-blue.svg)](./README_KR.md)
 
-본 리포지토리는 **TRUST-AI (ECAI 2025)** 워크샵에 채택된 논문 **"Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs"**의 공식 구현체 및 실험 코드를 포함함.
+This repository contains the official implementation and experimental code for the paper **"Discriminator-Guided Unlearning: A Framework for Selective Forgetting in Conditional GANs"** accepted at **TRUST-AI (ECAI 2025)**.
 
-본 연구는 **ACGAN (Auxiliary Classifier GAN)** 모델에서 특정 클래스 데이터를 선택적으로 삭제(Unlearning)하기 위한 새로운 2단계 프레임워크를 제안함. 생성자(Generator)를 직접 수정하는 대신, 판별자(Discriminator)의 능력을 의도적으로 약화시키고 그 피드백을 통해 생성자를 유도하는 방식을 사용함. 이를 통해 **재학습(Retraining)** 수준의 망각 성능을 달성하면서도 **치명적 망각(Catastrophic Forgetting)** 문제를 효과적으로 완화함.
-
----
-
-## 1. 주요 기여 (Key Contributions)
-
-*   **판별자 유도 언러닝 (Discriminator-Guided Unlearning)**: 판별자에 혼란을 주어 생성자가 망각 대상 클래스 생성을 스스로 중단하도록 유도하는 메커니즘 제안.
-*   **2단계 프레임워크 구조**:
-    *   **1단계 (Soft Forgetting)**: 판별자가 망각 대상 클래스를 제대로 인식하지 못하도록 약화시킴.
-    *   **2단계 (Fine-tuning)**: 약화된 판별자의 피드백을 사용하여 생성자를 미세 조정함.
-*   **포괄적 검증**:
-    *   MNIST, FashionMNIST, SVHN, CIFAR-10 데이터셋에 대한 정량적 평가 (FID, KID, IS).
-    *   **멤버십 추론 공격(MIA)** 및 **모델 역전 공격(Inversion Attack)**을 통한 프라이버시 보호 성능 검증.
-*   **실험 효율성**: 단일 GPU 및 다중 GPU (DDP) 환경을 완벽 지원하며, 재학습 대비 획기적인 시간 단축 달성.
+We propose a novel two-step framework for **ACGAN (Auxiliary Classifier GAN)** to selectively remove specific class data from a trained model. Instead of directly modifying the generator, our approach intentionally weakens the discriminator's ability to recognize the target class and uses this "confused" feedback to guide the generator. This effectively mitigates **catastrophic forgetting** while achieving unlearning performance comparable to retraining from scratch.
 
 ---
 
-## 2. 프로젝트 구조 (Project Structure)
+## 1. Key Contributions
+
+*   **Discriminator-Guided Unlearning**: A novel mechanism that induces confusion in the discriminator to guide the generator, avoiding direct damage to the generator's weights.
+*   **Two-Step Framework**:
+    *   **Step 1 (Soft Forgetting)**: Weakens the discriminator's recognition of the target class.
+    *   **Step 2 (Fine-tuning)**: Updates the generator using the feedback from the weakened discriminator.
+*   **Comprehensive Evaluation**:
+    *   **Quantitative**: Performance measured using **FID**, **KID**, and **IS** on MNIST, FashionMNIST, SVHN, and CIFAR-10.
+    *   **Privacy & Robustness**: Verified through **Membership Inference Attacks (MIA)** and **Model Inversion Attacks**.
+*   **Flexible Environment**: Supports both **Single-GPU** and **Multi-GPU (DDP)** training.
+
+---
+
+## 2. Project Structure
 
 ```text
 acgan_unlearning_project/
 │
-├── acgan/                     # [Package] 핵심 로직
-│   ├── dataset.py             # 데이터 로드 및 전처리 (DDP 지원)
-│   ├── model.py               # ACGAN 모델 및 Efficient GAN Loss (Hinge Loss)
-│   ├── trainer.py             # 단계별 학습 함수 (Original, Baseline, Unlearning)
-│   └── utils.py               # 로깅 및 시각화 유틸리티
+├── acgan/                     # [Package] Core Logic
+│   ├── __init__.py
+│   ├── dataset.py             # Data loading & Preprocessing
+│   ├── model.py               # ACGAN Generator, Discriminator, EfficientGANLoss
+│   ├── trainer.py             # Training loops (Original, Baseline, Unlearning Steps)
+│   └── utils.py               # Visualization & Logging utilities
 │
-├── train.py                   # [Main] 학습 실행 스크립트
-├── evaluate_all.py            # [Eval] 생성 품질 및 망각 성능 평가 (FID, IS)
-├── evaluate_mia.py            # [Eval] 멤버십 추론 공격 방어 성능 평가
-├── evaluate_inversion.py      # [Eval] 모델 역전 공격 시각화 평가
-├── config.json                # 실험 설정 및 하이퍼파라미터
-├── requirements.txt           # 의존성 패키지
-└── README_KR.md               # 프로젝트 설명서 (국문)
+├── train.py                   # [Main] Training Script (Single/Multi-GPU)
+├── evaluate_all.py            # [Eval] Performance Metrics (FID, IS, KID)
+├── evaluate_mia.py            # [Eval] Membership Inference Attack (Targeted)
+├── evaluate_inversion.py      # [Eval] Model Inversion Attack (Visual Inspection)
+├── config.json                # Hyperparameters & Experiment Settings
+├── requirements.txt           # Dependencies
+└── README.md                  # Documentation (English)
 ```
 
 ---
 
-## 3. 실행 방법 (Usage)
+## 3. Setup
 
-### 3.1. 환경 설정 및 설치
+### 3.1. Prerequisites
+*   Python 3.8+
+*   NVIDIA GPU & CUDA 11.x+
+*   PyTorch (CUDA support required)
+
+### 3.2. Installation
 ```bash
 git clone <repository_url>
 cd acgan_unlearning_project
 pip install -r requirements.txt
 ```
 
-### 3.2. 설정 (`config.json`)
-`config.json` 파일에서 망각 대상 클래스(`forget_label`) 및 학습 파라미터 수정 가능.
+---
 
-### 3.3. 학습 (`train.py`)
-Single-GPU 및 Multi-GPU 환경을 자동 감지하여 실행함.
+## 4. Usage
+
+### 4.1. Configuration (`config.json`)
+Modify `config.json` to set the target class (`forget_label`) and hyperparameters.
+*   `soft_label_target_list`: List of soft target values for Step 1 (e.g., `[0.0, 0.1]`).
+*   `run_*_flag`: Control execution of Original training, Baselines (Retrain/Finetune), and Unlearning steps.
+
+### 4.2. Training (`train.py`)
+The script automatically handles Single-GPU or Multi-GPU (DDP) based on the environment.
+
 ```bash
-# 단일 GPU 실행
+# Single GPU
 python train.py
 
-# 다중 GPU 실행 (예: GPU 2개)
+# Multi-GPU (e.g., 2 GPUs)
 torchrun --standalone --nproc_per_node=2 train.py
 ```
+*   **Execution Time Logging**: Training times for all stages are automatically saved to `execution_times.csv`.
 
-### 3.4. 평가 및 분석
-*   **성능 평가**: `python evaluate_all.py` (FID, IS 등 측정 후 CSV 저장)
-*   **프라이버시 평가**: `python evaluate_mia.py` (MIA 공격 정확도 측정)
-*   **시각적 검증**: `python evaluate_inversion.py` (모델 역전 공격을 통한 이미지 복원 시도)
+### 4.3. Evaluation
+
+#### Performance (FID, IS, KID)
+Evaluates the generation quality and forgetting effectiveness.
+```bash
+python evaluate_all.py --output evaluation_summary.csv
+```
+
+#### Privacy Assessment (MIA)
+Measures the defense capability against Membership Inference Attacks on Forget/Retain sets.
+```bash
+python evaluate_mia.py
+```
+
+#### Visual Inspection (Inversion Attack)
+Performs Model Inversion Attack to visually verify if the target class has been unlearned.
+```bash
+python evaluate_inversion.py
+```
 
 ---
 
-## 4. 인용 (Citation)
+## 5. Citation
 
-본 코드를 연구에 활용할 경우, 아래 논문을 인용 바람.
+If you use this code, please cite our paper:
 
 ```bibtex
 @inproceedings{lee2025discriminator,
@@ -89,22 +118,21 @@ torchrun --standalone --nproc_per_node=2 train.py
 
 ---
 
-## 5. 특허 (Patent)
+## 6. Patent
 
-본 연구 결과물은 대한민국 특허청에 출원됨.
+This technology is patent pending with the Korean Intellectual Property Office (KIPO).
 
-*   **발명의 명칭**: 판별기 기반 조건부 생성적 적대 신경망에서의 선택적 데이터 망각 방법 그 장치
-    *   (METHOD FOR SELECTIVE DATA FORGETTING IN DISCRIMINATOR-BASED CONDITIONAL GENERATIVE ADVERSARIAL NETWORKS)
-*   **출원 번호**: 10-2025-0133282
-*   **출원 일자**: 2025.09.17
-*   **출원인**: 중앙대학교 산학협력단
-*   **발명자**: 노승민, 김상민, 이미영, 이병천
+*   **Title**: METHOD FOR SELECTIVE DATA FORGETTING IN DISCRIMINATOR-BASED CONDITIONAL GENERATIVE ADVERSARIAL NETWORKS
+*   **Application Number**: 10-2025-0133282
+*   **Date of Application**: 2025.09.17
+*   **Applicant**: Industry-University Cooperation Foundation, Chung-Ang University
+*   **Inventors**: Seungmin Rho, Sangmin Kim, Mi Young Lee, Byeongcheon Lee
 
 ---
 
-## 6. 라이선스 (License)
+## 7. License
 
-이 프로젝트는 **Creative Commons Attribution 4.0 International License (CC BY 4.0)**에 따라 라이선스가 부여됨.
+This project is licensed under the **Creative Commons Attribution 4.0 International License (CC BY 4.0)**.
 
-*   **저작권자**: 이병천, 김상민, 박성우, 노승민, 이미영
-*   **출처**: TRUST-AI @ ECAI 2025
+*   **Copyright**: Byeongcheon Lee, Sangmin Kim, Sungwoo Park, Seungmin Rho, Mi Young Lee
+*   **Source**: TRUST-AI @ ECAI 2025
