@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 
-# Dataset (용량 초과 방지)
+# Dataset
 data/
 
 # Outputs & Model Weights
@@ -11,14 +11,18 @@ outputs/
 *.pt
 inversion_attack_results/
 
-# Logs & Results
+# Logs & Results & Temps
 *.log
 *.png
 *.jpg
 *.gif
 *.csv
 *.json
-!config.json  # config.json은 설정 파일이므로 업로드 허용
+ddp_sync_file
+total_code.txt
+
+# Config file exception (설정 파일은 업로드)
+!config.json
 
 # System files
 .DS_Store

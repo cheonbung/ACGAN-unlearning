@@ -1,0 +1,33 @@
+{
+    "latent_dim": 100,
+    "num_classes": 10,
+    "label_embedding_dim_g": 50,
+    "batch_size": 512,
+    "lr_g": 2e-5,
+    "lr_d": 4e-5,
+    "aux_loss_weight": 1.0,
+    "original_epochs": 500,
+    "step1_epochs": 500,
+    "step2_epochs": 50,
+    "save_every": 5,
+    "alpha": 1.0,
+    "beta": 1.0,
+    "forget_label": 3,
+    "soft_label_target_list": [0.1],
+    "dataset_configs": {
+        "MNIST": {"img_channels": 1, "img_size": 28, "enabled": true },
+        "FashionMNIST": {"img_channels": 1, "img_size": 28, "enabled": true},
+        "SVHN": {"img_channels": 3, "img_size": 32, "enabled": true},
+        "CIFAR10": {"img_channels": 3, "img_size": 32, "enabled": true},
+        "STL10": {"img_channels": 3, "img_size": 96, "enabled": false}
+    },
+    "run_stage1_1_flag": true,
+    "run_stage1_2_flag": true,
+    "run_stage2_flag": true,
+    "run_baseline_retrain_flag": true,
+    "run_baseline_finetune_flag": true,
+    "finetune_epochs": 50,
+    "enable_profiler_stage1_1": false,
+    "enable_profiler_stage1_2": false,
+    "enable_profiler_stage2": false
+}
