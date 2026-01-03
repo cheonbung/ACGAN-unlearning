@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Dataset (용량 초과 방지)
+data/
+
+# Outputs & Model Weights
+outputs/
+*.pth
+*.pt
+inversion_attack_results/
+
+# Logs & Results
+*.log
+*.png
+*.jpg
+*.gif
+*.csv
+*.json
+!config.json  # config.json은 설정 파일이므로 업로드 허용
+
+# System files
+.DS_Store
+Thumbs.db

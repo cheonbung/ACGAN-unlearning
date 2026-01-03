@@ -1,0 +1,2037 @@
+﻿--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\acgan\dataset.py ---
+# acgan/dataset.py
+
+import torch
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
+
+def get_dataloader(dataset_name, train, **config):
+    """
+    지정된 데이터셋 이름에 대한 DataLoader를 생성하고 반환합니다.
+    **config를 통해 유연하게 파라미터를 받습니다.
+
+    Args:
+        dataset_name (str): 데이터셋 이름 (e.g., "CIFAR10").
+        train (bool): True이면 학습 데이터셋, False이면 테스트 데이터셋을 로드.
+        **config: batch_size, world_size, rank 등 추가 설정이 담긴 딕셔너리.
+    """
+    # config 딕셔너리에서 필요한 파라미터 추출
+    d_config = config["dataset_configs"][dataset_name]
+    img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+    batch_size = config["batch_size"]
+    
+    # DDP 관련 파라미터는 없으면 기본값으로 설정
+    world_size = config.get("world_size", 1)
+    rank = config.get("rank", 0)
+    
+    # 필터링 관련 파라미터
+    exclude_label = config.get("exclude_label", None)
+
+    if img_size not in [28, 32, 96]:
+        raise ValueError(f"⚠️ 경고: {dataset_name} ({img_size}x{img_size})는 지원되지 않습니다. 모델은 28, 32, 96만 지원합니다.")
+
+    # 데이터 변환 설정
+    transform_list = [transforms.Resize(img_size), transforms.ToTensor()]
+    if img_channels == 1:
+        transform_list.append(transforms.Normalize((0.5,), (0.5,)))
+    else: 
+        transform_list.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
+    transform = transforms.Compose(transform_list)
+
+    # 데이터셋 이름과 train 플래그에 따라 적절한 데이터셋 로드
+    dataset_map = {
+        "SVHN": (datasets.SVHN, {"split": "train" if train else "test"}),
+        "CIFAR10": (datasets.CIFAR10, {"train": train}),
+        "MNIST": (datasets.MNIST, {"train": train}),
+        "FashionMNIST": (datasets.FashionMNIST, {"train": train}),
+        "STL10": (datasets.STL10, {"split": "train" if train else "test"}),
+    }
+    
+    if dataset_name not in dataset_map:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    dataset_class, kwargs = dataset_map[dataset_name]
+    full_dataset = dataset_class(root="./data", download=True, transform=transform, **kwargs)
+    
+    if len(full_dataset) == 0:
+        raise RuntimeError(f"ERROR: Dataset {dataset_name} (train={train}) is empty after loading.")
+    
+    # 레이블 제외 필터링 로직
+    dataset_to_use = full_dataset
+    if exclude_label is not None:
+        # 데이터셋마다 레이블 속성 이름이 다름 ('targets' 또는 'labels')
+        targets = getattr(full_dataset, 'targets', getattr(full_dataset, 'labels', None))
+        if targets is None:
+            raise AttributeError(f"Dataset {dataset_name} does not have 'targets' or 'labels' attribute for filtering.")
+
+        original_len = len(full_dataset)
+        indices = [i for i, label in enumerate(targets) if label != exclude_label]
+        dataset_to_use = Subset(full_dataset, indices)
+        
+        if rank == 0:
+            print(f"✅ Excluding label {exclude_label}. Original size: {original_len}, New size: {len(dataset_to_use)}")
+
+    # DDP를 위한 Sampler 설정
+    sampler, shuffle = None, True
+    if world_size > 1:
+        sampler = DistributedSampler(dataset_to_use, num_replicas=world_size, rank=rank, shuffle=True)
+        shuffle = False
+
+    # DataLoader 생성
+    dataloader = DataLoader(
+        dataset_to_use, batch_size=batch_size, shuffle=shuffle, 
+        num_workers=2, pin_memory=True, drop_last=True, sampler=sampler
+    )
+    
+    if rank == 0:
+        log_msg = f"✅ {dataset_name} (train={train})"
+        if exclude_label is not None:
+            log_msg += f" (excluding label {exclude_label})"
+        log_msg += f" 데이터 로더 생성 완료. (총 {len(dataset_to_use)}개 이미지, DDP: {'Enabled' if sampler else 'Disabled'})"
+        print(log_msg)
+        
+    return dataloader, sampler
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\acgan\model.py ---
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
+
+class SelfAttention(nn.Module):
+    """Self-Attention 모듈 (SAGAN 기반)"""
+    def __init__(self, in_channels):
+        super(SelfAttention, self).__init__()
+        self.in_channels = in_channels
+        self.query = spectral_norm(nn.Conv2d(in_channels, in_channels // 8, kernel_size=1))
+        self.key = spectral_norm(nn.Conv2d(in_channels, in_channels // 8, kernel_size=1))
+        self.value = spectral_norm(nn.Conv2d(in_channels, in_channels, kernel_size=1))
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, C, H, W = x.size()
+        query = self.query(x).view(batch_size, -1, H * W).permute(0, 2, 1)
+        key = self.key(x).view(batch_size, -1, H * W)
+        value = self.value(x).view(batch_size, -1, H * W)
+        attention = torch.bmm(query, key)
+        attention = F.softmax(attention, dim=-1)
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, H, W)
+        return self.gamma * out + x
+
+class ResidualBlock(nn.Module):
+    """Residual Block with conditional batch normalization for Generator"""
+    def __init__(self, in_channels, out_channels, num_classes=10, upsample=False):
+        super(ResidualBlock, self).__init__()
+        self.upsample = upsample
+        self.bn1 = nn.BatchNorm2d(in_channels, affine=False)
+        self.bn2 = nn.BatchNorm2d(out_channels, affine=False)
+        self.gamma1_emb = nn.Embedding(num_classes, in_channels)
+        self.beta1_emb = nn.Embedding(num_classes, in_channels)
+        self.gamma2_emb = nn.Embedding(num_classes, out_channels)
+        self.beta2_emb = nn.Embedding(num_classes, out_channels)
+        self.conv1 = spectral_norm(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False))
+        self.conv2 = spectral_norm(nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False))
+        self.skip_conv = spectral_norm(nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)) if in_channels != out_channels or upsample else nn.Identity()
+
+    def forward(self, x, labels):
+        h = self.bn1(x)
+        gamma1, beta1 = self.gamma1_emb(labels).unsqueeze(-1).unsqueeze(-1), self.beta1_emb(labels).unsqueeze(-1).unsqueeze(-1)
+        h = h * (1 + gamma1) + beta1
+        h = F.relu(h)
+        if self.upsample:
+            h = F.interpolate(h, scale_factor=2, mode='nearest')
+        h = self.conv1(h)
+        h = self.bn2(h)
+        gamma2, beta2 = self.gamma2_emb(labels).unsqueeze(-1).unsqueeze(-1), self.beta2_emb(labels).unsqueeze(-1).unsqueeze(-1)
+        h = h * (1 + gamma2) + beta2
+        h = F.relu(h)
+        h = self.conv2(h)
+        skip_x = x
+        if self.upsample:
+            skip_x = F.interpolate(skip_x, scale_factor=2, mode='nearest')
+        skip_x = self.skip_conv(skip_x)
+        return h + skip_x
+
+class ACGANGenerator(nn.Module):
+    """ACGAN Generator - ResNet 기반 + Self-Attention + Conditional BN"""
+    def __init__(self, latent_dim=128, num_classes=10, label_embedding_dim=50, img_size=32, img_channels=1):
+        super(ACGANGenerator, self).__init__()
+        
+        if img_size == 28:
+            self.init_size, self.linear_channels = 7, 256
+        elif img_size == 32:
+            self.init_size, self.linear_channels = 4, 512
+        elif img_size == 96:
+            self.init_size, self.linear_channels = 6, 512
+        else:
+            raise ValueError(f"Unsupported img_size: {img_size}. Must be 28, 32, or 96.")
+
+        self.label_emb = nn.Embedding(num_classes, label_embedding_dim)
+        self.linear = nn.Sequential(
+            spectral_norm(nn.Linear(latent_dim + label_embedding_dim, self.linear_channels * self.init_size * self.init_size)),
+            nn.BatchNorm1d(self.linear_channels * self.init_size * self.init_size),
+            nn.ReLU(True)
+        )
+
+        if img_size == 28:
+            self.blocks = nn.ModuleList([
+                ResidualBlock(256, 128, num_classes, upsample=True), # 7 -> 14
+                ResidualBlock(128, 64, num_classes, upsample=True), # 14 -> 28
+            ])
+            self.attention = SelfAttention(64)
+            self.final_conv = nn.Conv2d(64, img_channels, 3, 1, 1)
+        elif img_size == 32:
+            self.blocks = nn.ModuleList([
+                ResidualBlock(512, 256, num_classes, upsample=True), # 4 -> 8
+                ResidualBlock(256, 128, num_classes, upsample=True), # 8 -> 16
+                ResidualBlock(128, 64, num_classes, upsample=True), # 16 -> 32
+            ])
+            self.attention = SelfAttention(64)
+            self.final_conv = nn.Conv2d(64, img_channels, 3, 1, 1)
+        elif img_size == 96:
+            self.blocks = nn.ModuleList([
+                ResidualBlock(512, 512, num_classes, upsample=True), # 6 -> 12
+                ResidualBlock(512, 256, num_classes, upsample=True), # 12 -> 24
+                ResidualBlock(256, 128, num_classes, upsample=True), # 24 -> 48
+                ResidualBlock(128, 64, num_classes, upsample=True),  # 48 -> 96
+            ])
+            self.attention = SelfAttention(128) # Apply attention at a slightly larger feature map
+            self.final_conv = nn.Conv2d(64, img_channels, 3, 1, 1)
+
+    def forward(self, z, labels):
+        gen_input = torch.cat((z, self.label_emb(labels)), dim=-1)
+        h = self.linear(gen_input)
+        h = h.view(h.size(0), self.linear_channels, self.init_size, self.init_size)
+        
+        for i, block in enumerate(self.blocks):
+            h = block(h, labels)
+            # Apply attention at a predefined layer (e.g., after the 3rd block for 96x96)
+            if self.attention and h.size(1) == self.attention.in_channels:
+                 h = self.attention(h)
+        
+        h = self.final_conv(h)
+        return torch.tanh(h)
+
+class ACGANDiscriminator(nn.Module):
+    """ACGAN Discriminator - Spectral Normalization + Self-Attention + Source/Class Heads"""
+    def __init__(self, num_classes=10, img_size=32, img_channels=1):
+        super(ACGANDiscriminator, self).__init__()
+        self.num_classes = num_classes
+
+        if img_size == 28:
+            self.main = nn.Sequential(
+                spectral_norm(nn.Conv2d(img_channels, 64, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),
+                spectral_norm(nn.Conv2d(64, 128, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),
+                spectral_norm(nn.Conv2d(128, 256, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),
+                SelfAttention(256),
+                spectral_norm(nn.Conv2d(256, 512, 3, 1, 0)), nn.LeakyReLU(0.2, inplace=True),
+            )
+            final_conv_channels = 512
+        elif img_size == 32:
+            self.main = nn.Sequential(
+                spectral_norm(nn.Conv2d(img_channels, 64, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),
+                spectral_norm(nn.Conv2d(64, 128, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),
+                spectral_norm(nn.Conv2d(128, 256, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),
+                SelfAttention(256),
+                spectral_norm(nn.Conv2d(256, 512, 4, 1, 0)), nn.LeakyReLU(0.2, inplace=True),
+            )
+            final_conv_channels = 512
+        elif img_size == 96:
+            self.main = nn.Sequential(
+                spectral_norm(nn.Conv2d(img_channels, 64, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True), # 96->48
+                spectral_norm(nn.Conv2d(64, 128, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True),  # 48->24
+                spectral_norm(nn.Conv2d(128, 256, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True), # 24->12
+                SelfAttention(256),
+                spectral_norm(nn.Conv2d(256, 512, 4, 2, 1)), nn.LeakyReLU(0.2, inplace=True), # 12->6
+                spectral_norm(nn.Conv2d(512, 1024, 6, 1, 0)), nn.LeakyReLU(0.2, inplace=True),# 6->1
+            )
+            final_conv_channels = 1024
+        else:
+            raise ValueError(f"Unsupported img_size: {img_size}. Must be 28, 32, or 96.")
+
+        self.source_output = spectral_norm(nn.Conv2d(final_conv_channels, 1, 1, 1, 0))
+        self.class_output = spectral_norm(nn.Conv2d(final_conv_channels, num_classes, 1, 1, 0))
+
+    def forward(self, x):
+        h = self.main(x)
+        source_pred = self.source_output(h).view(x.size(0), -1)
+        class_pred = self.class_output(h).view(x.size(0), self.num_classes)
+        return source_pred, class_pred
+
+class EfficientGANLoss(nn.Module):
+    """효율적인 GAN Loss - Hinge Loss 사용"""
+    def __init__(self):
+        super(EfficientGANLoss, self).__init__()
+    
+    def discriminator_loss(self, real_pred, fake_pred):
+        # 이 부분이 Hinge Loss의 판별자 손실 함수입니다.
+        real_loss = torch.mean(F.relu(1.0 - real_pred))
+        fake_loss = torch.mean(F.relu(1.0 + fake_pred))
+        return real_loss + fake_loss
+    
+    def generator_loss(self, fake_pred):
+        # 이 부분이 Hinge Loss의 생성자 손실 함수입니다.
+        return -torch.mean(fake_pred)
+
+def initialize_weights(model):
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            if m.weight is not None: nn.init.normal_(m.weight, 1.0, 0.02)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\acgan\trainer.py ---
+# acgan/trainer.py
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision.utils as vutils
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm.auto import tqdm
+import os
+import json
+import time # 💡 소요 시간 측정을 위해 time 라이브러리 임포트
+
+from .model import ACGANGenerator, ACGANDiscriminator, initialize_weights, EfficientGANLoss
+from .utils import create_training_gif, save_loss_plot
+
+# 💡 모든 run_* 함수가 소요 시간을 반환하도록 수정되었습니다.
+
+def run_stage1_1(config, dataloader, sampler, rank, world_size, device, fixed_noise, fixed_labels):
+    start_time = time.time() # 💡 시작 시간 측정
+    dataset_name = config["current_dataset_name"]
+    d_config = config["dataset_configs"][dataset_name]
+    img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+
+    base_dir = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Original"
+    model_save_dir = os.path.join(base_dir, "models")
+
+    skip_flag = torch.tensor([0], device=device)
+    if rank == 0:
+        if os.path.exists(os.path.join(model_save_dir, "generator.pth")) and os.path.exists(os.path.join(model_save_dir, "discriminator.pth")):
+            tqdm.write(f"\n✅ Stage 1-1 SKIPPED: Original models already exist.")
+            skip_flag.fill_(1)
+    
+    if world_size > 1: torch.distributed.broadcast(skip_flag, src=0)
+    if skip_flag.item() == 1:
+        if world_size > 1: torch.distributed.barrier()
+        return 0.0 # 💡 스킵된 경우 0.0 반환
+
+    # ... (중간 학습 로직은 동일) ...
+    writer, loss_log = None, None
+    if rank == 0:
+        print(f"\n--- Stage 1-1: {dataset_name} Original ACGAN 훈련 ---")
+        img_dir, gif_dir = [os.path.join(base_dir, d) for d in ["images", "gifs"]]
+        os.makedirs(model_save_dir, exist_ok=True); os.makedirs(img_dir, exist_ok=True); os.makedirs(gif_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=os.path.join(base_dir, "runs", "Original_ACGAN"))
+        loss_log = {"epoch": [], "g_loss": [], "d_loss": [], "g_loss_gan": [], "g_loss_aux": [], "d_loss_gan": [], "d_loss_aux_real": [], "d_loss_aux_fake": []}
+
+    generator = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size, img_channels).to(device)
+    discriminator = ACGANDiscriminator(config["num_classes"], img_size, img_channels).to(device)
+    initialize_weights(generator); initialize_weights(discriminator)
+
+    if world_size > 1:
+        generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
+        discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
+
+    gan_loss_fn, aux_criterion = EfficientGANLoss().to(device), nn.CrossEntropyLoss().to(device)
+    g_optimizer = optim.Adam(generator.parameters(), lr=config["lr_g"], betas=(0.5, 0.999))
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=config["lr_d"], betas=(0.5, 0.999))
+    
+    epochs = config["original_epochs"]
+    epoch_pbar = tqdm(range(epochs), desc="Stage 1-1 Epochs", position=2, leave=False, disable=(rank != 0))
+    for epoch in epoch_pbar:
+        if sampler is not None: sampler.set_epoch(epoch)
+        
+        epoch_g_loss, epoch_d_loss, epoch_g_loss_gan, epoch_g_loss_aux = 0.0, 0.0, 0.0, 0.0
+        epoch_d_loss_gan, epoch_d_loss_aux_real, epoch_d_loss_aux_fake = 0.0, 0.0, 0.0
+
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", position=3, leave=False, disable=(rank != 0))
+        for real_imgs, labels in batch_pbar:
+            real_imgs, labels, batch_size = real_imgs.to(device), labels.to(device), real_imgs.size(0)
+            
+            d_optimizer.zero_grad()
+            real_src_pred, real_cls_pred = discriminator(real_imgs)
+            z_d = torch.randn(batch_size, config["latent_dim"], device=device)
+            gen_labels_d = torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            with torch.no_grad(): fake_imgs = generator(z_d, gen_labels_d)
+            fake_src_pred, fake_cls_pred = discriminator(fake_imgs)
+            d_loss_gan = gan_loss_fn.discriminator_loss(real_src_pred, fake_src_pred)
+            d_loss_aux_real = aux_criterion(real_cls_pred, labels)
+            d_loss_aux_fake = aux_criterion(fake_cls_pred, gen_labels_d)
+            d_loss = d_loss_gan + config["aux_loss_weight"] * (d_loss_aux_real + d_loss_aux_fake)
+            d_loss.backward(); d_optimizer.step()
+
+            g_optimizer.zero_grad()
+            z_g, gen_labels_g = torch.randn(batch_size, config["latent_dim"], device=device), torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            gen_imgs_g = generator(z_g, gen_labels_g)
+            g_src_output, g_cls_output = discriminator(gen_imgs_g)
+            g_loss_gan = gan_loss_fn.generator_loss(g_src_output)
+            g_loss_aux = aux_criterion(g_cls_output, gen_labels_g)
+            g_loss = g_loss_gan + config["aux_loss_weight"] * g_loss_aux
+            g_loss.backward(); g_optimizer.step()
+            
+            epoch_d_loss += d_loss.item(); epoch_g_loss += g_loss.item()
+            epoch_d_loss_gan += d_loss_gan.item(); epoch_g_loss_gan += g_loss_gan.item()
+            epoch_d_loss_aux_real += d_loss_aux_real.item(); epoch_d_loss_aux_fake += d_loss_aux_fake.item()
+            epoch_g_loss_aux += g_loss_aux.item()
+
+        if rank == 0:
+            num_batches = len(dataloader)
+            avg_g_loss, avg_d_loss = epoch_g_loss / num_batches, epoch_d_loss / num_batches
+            avg_g_gan, avg_g_aux = epoch_g_loss_gan / num_batches, epoch_g_loss_aux / num_batches
+            avg_d_gan, avg_d_aux_r, avg_d_aux_f = epoch_d_loss_gan / num_batches, epoch_d_loss_aux_real / num_batches, epoch_d_loss_aux_fake / num_batches
+
+            loss_log["epoch"].append(epoch + 1); loss_log["g_loss"].append(avg_g_loss); loss_log["d_loss"].append(avg_d_loss)
+            loss_log["g_loss_gan"].append(avg_g_gan); loss_log["g_loss_aux"].append(avg_g_aux); loss_log["d_loss_gan"].append(avg_d_gan)
+            loss_log["d_loss_aux_real"].append(avg_d_aux_r); loss_log["d_loss_aux_fake"].append(avg_d_aux_f)
+            
+            writer.add_scalar('Stage1-1/Loss/G_Total', avg_g_loss, epoch+1); writer.add_scalar('Stage1-1/Loss/G_GAN', avg_g_gan, epoch+1); writer.add_scalar('Stage1-1/Loss/G_Aux', avg_g_aux, epoch+1)
+            writer.add_scalar('Stage1-1/Loss/D_Total', avg_d_loss, epoch+1); writer.add_scalar('Stage1-1/Loss/D_GAN', avg_d_gan, epoch+1)
+            writer.add_scalar('Stage1-1/Loss/D_Aux_Real', avg_d_aux_r, epoch+1); writer.add_scalar('Stage1-1/Loss/D_Aux_Fake', avg_d_aux_f, epoch+1)
+            
+            if (epoch+1) % config["save_every"] == 0 or epoch == epochs - 1:
+                with torch.no_grad():
+                    g_eval = generator.module if world_size > 1 else generator
+                    g_eval.eval()
+                    samples = g_eval(fixed_noise, fixed_labels).detach().cpu()
+                    vutils.save_image(samples, os.path.join(img_dir, f"epoch_{epoch+1:03d}.png"), nrow=10, normalize=True)
+                    writer.add_image('Stage1-1/Generated_Images', vutils.make_grid(samples, nrow=10, normalize=True), epoch+1)
+                    g_eval.train()
+
+    elapsed_time = time.time() - start_time # 💡 종료 시간 측정 및 계산
+    if rank == 0:
+        if writer is not None: writer.close()
+        create_training_gif(img_dir, gif_dir, "Original_ACGAN")
+        loss_log_path, plot_path = os.path.join(base_dir, "loss_log.json"), os.path.join(base_dir, "loss_plot.png")
+        with open(loss_log_path, 'w') as f: json.dump(loss_log, f, indent=4)
+        save_loss_plot(loss_log_path, plot_path, "Original ACGAN")
+        g_to_save, d_to_save = (m.module if world_size > 1 else m for m in [generator, discriminator])
+        torch.save(g_to_save.state_dict(), os.path.join(model_save_dir, "generator.pth")); torch.save(d_to_save.state_dict(), os.path.join(model_save_dir, "discriminator.pth"))
+        tqdm.write(f"✅ Stage 1-1 완료: {dataset_name} Original ACGAN 학습 완료. (소요 시간: {elapsed_time:.2f}초)")
+        
+    if world_size > 1: torch.distributed.barrier()
+    return elapsed_time # 💡 계산된 소요 시간 반환
+
+# (run_baseline_retrain, run_baseline_finetune, run_stage1_2, run_stage2 함수도 동일한 방식으로 수정합니다)
+
+def run_baseline_retrain(config, dataloader, sampler, rank, world_size, device, fixed_noise, fixed_labels):
+    start_time = time.time()
+    dataset_name = config["current_dataset_name"]; d_config = config["dataset_configs"][dataset_name]; img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+    base_dir = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Baseline_Retrain"; model_save_dir = os.path.join(base_dir, "models")
+    skip_flag = torch.tensor([0], device=device)
+    if rank == 0:
+        if os.path.exists(os.path.join(model_save_dir, "generator.pth")) and os.path.exists(os.path.join(model_save_dir, "discriminator.pth")):
+            tqdm.write(f"\n✅ Baseline Retrain SKIPPED: Retrained models already exist.")
+            skip_flag.fill_(1)
+    if world_size > 1: torch.distributed.broadcast(skip_flag, src=0)
+    if skip_flag.item() == 1:
+        if world_size > 1: torch.distributed.barrier()
+        return 0.0
+    # ... (중간 로직 동일) ...
+    writer, loss_log = None, None
+    if rank == 0:
+        print(f"\n--- Baseline: {dataset_name} Retraining from Scratch ---")
+        img_dir, gif_dir = [os.path.join(base_dir, d) for d in ["images", "gifs"]]; os.makedirs(model_save_dir, exist_ok=True); os.makedirs(img_dir, exist_ok=True); os.makedirs(gif_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=os.path.join(base_dir, "runs", "Baseline_Retrain"))
+        loss_log = {"epoch": [], "g_loss": [], "d_loss": [], "g_loss_gan": [], "g_loss_aux": [], "d_loss_gan": [], "d_loss_aux_real": [], "d_loss_aux_fake": []}
+    generator = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size, img_channels).to(device); discriminator = ACGANDiscriminator(config["num_classes"], img_size, img_channels).to(device)
+    initialize_weights(generator); initialize_weights(discriminator)
+    if world_size > 1:
+        generator = DDP(generator, device_ids=[rank], find_unused_parameters=True); discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
+    gan_loss_fn, aux_criterion = EfficientGANLoss().to(device), nn.CrossEntropyLoss().to(device)
+    g_optimizer = optim.Adam(generator.parameters(), lr=config["lr_g"], betas=(0.5, 0.999)); d_optimizer = optim.Adam(discriminator.parameters(), lr=config["lr_d"], betas=(0.5, 0.999))
+    epochs = config["original_epochs"]
+    epoch_pbar = tqdm(range(epochs), desc="Baseline Retrain Epochs", position=2, leave=False, disable=(rank != 0))
+    for epoch in epoch_pbar:
+        if sampler is not None: sampler.set_epoch(epoch)
+        epoch_g_loss, epoch_d_loss, epoch_g_loss_gan, epoch_g_loss_aux = 0.0, 0.0, 0.0, 0.0
+        epoch_d_loss_gan, epoch_d_loss_aux_real, epoch_d_loss_aux_fake = 0.0, 0.0, 0.0
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", position=3, leave=False, disable=(rank != 0))
+        for real_imgs, labels in batch_pbar:
+            real_imgs, labels, batch_size = real_imgs.to(device), labels.to(device), real_imgs.size(0)
+            d_optimizer.zero_grad()
+            real_src_pred, real_cls_pred = discriminator(real_imgs)
+            z_d = torch.randn(batch_size, config["latent_dim"], device=device); gen_labels_d = torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            with torch.no_grad(): fake_imgs = generator(z_d, gen_labels_d)
+            fake_src_pred, fake_cls_pred = discriminator(fake_imgs)
+            d_loss_gan, d_loss_aux_real, d_loss_aux_fake = gan_loss_fn.discriminator_loss(real_src_pred, fake_src_pred), aux_criterion(real_cls_pred, labels), aux_criterion(fake_cls_pred, gen_labels_d)
+            d_loss = d_loss_gan + config["aux_loss_weight"] * (d_loss_aux_real + d_loss_aux_fake)
+            d_loss.backward(); d_optimizer.step()
+            g_optimizer.zero_grad()
+            z_g, gen_labels_g = torch.randn(batch_size, config["latent_dim"], device=device), torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            gen_imgs_g = generator(z_g, gen_labels_g)
+            g_src_output, g_cls_output = discriminator(gen_imgs_g)
+            g_loss_gan, g_loss_aux = gan_loss_fn.generator_loss(g_src_output), aux_criterion(g_cls_output, gen_labels_g)
+            g_loss = g_loss_gan + config["aux_loss_weight"] * g_loss_aux
+            g_loss.backward(); g_optimizer.step()
+            epoch_d_loss += d_loss.item(); epoch_g_loss += g_loss.item(); epoch_d_loss_gan += d_loss_gan.item(); epoch_g_loss_gan += g_loss_gan.item(); epoch_d_loss_aux_real += d_loss_aux_real.item(); epoch_d_loss_aux_fake += d_loss_aux_fake.item(); epoch_g_loss_aux += g_loss_aux.item()
+        if rank == 0:
+            num_batches = len(dataloader)
+            avg_g_loss, avg_d_loss = epoch_g_loss / num_batches, epoch_d_loss / num_batches
+            avg_g_gan, avg_g_aux = epoch_g_loss_gan / num_batches, epoch_g_loss_aux / num_batches
+            avg_d_gan, avg_d_aux_r, avg_d_aux_f = epoch_d_loss_gan / num_batches, epoch_d_loss_aux_real / num_batches, epoch_d_loss_aux_fake / num_batches
+            loss_log["epoch"].append(epoch + 1); loss_log["g_loss"].append(avg_g_loss); loss_log["d_loss"].append(avg_d_loss); loss_log["g_loss_gan"].append(avg_g_gan); loss_log["g_loss_aux"].append(avg_g_aux); loss_log["d_loss_gan"].append(avg_d_gan); loss_log["d_loss_aux_real"].append(avg_d_aux_r); loss_log["d_loss_aux_fake"].append(avg_d_aux_f)
+            writer.add_scalar('Baseline_Retrain/Loss/G_Total', avg_g_loss, epoch+1); writer.add_scalar('Baseline_Retrain/Loss/D_Total', avg_d_loss, epoch+1)
+            if (epoch+1) % config["save_every"] == 0 or epoch == epochs - 1:
+                with torch.no_grad():
+                    g_eval = generator.module if world_size > 1 else generator
+                    g_eval.eval(); samples = g_eval(fixed_noise, fixed_labels).detach().cpu(); vutils.save_image(samples, os.path.join(img_dir, f"epoch_{epoch+1:03d}.png"), nrow=10, normalize=True)
+                    writer.add_image('Baseline_Retrain/Generated_Images', vutils.make_grid(samples, nrow=10, normalize=True), epoch+1); g_eval.train()
+    elapsed_time = time.time() - start_time
+    if rank == 0:
+        if writer is not None: writer.close()
+        create_training_gif(img_dir, gif_dir, "Baseline_Retrain")
+        loss_log_path, plot_path = os.path.join(base_dir, "loss_log.json"), os.path.join(base_dir, "loss_plot.png")
+        with open(loss_log_path, 'w') as f: json.dump(loss_log, f, indent=4)
+        save_loss_plot(loss_log_path, plot_path, "Baseline Retrain")
+        g_to_save, d_to_save = (m.module if world_size > 1 else m for m in [generator, discriminator])
+        torch.save(g_to_save.state_dict(), os.path.join(model_save_dir, "generator.pth")); torch.save(d_to_save.state_dict(), os.path.join(model_save_dir, "discriminator.pth"))
+        tqdm.write(f"✅ Baseline Retrain 완료. (소요 시간: {elapsed_time:.2f}초)")
+    if world_size > 1: torch.distributed.barrier()
+    return elapsed_time
+
+def run_baseline_finetune(config, dataloader, sampler, rank, world_size, device, fixed_noise, fixed_labels):
+    start_time = time.time()
+    dataset_name = config["current_dataset_name"]; d_config = config["dataset_configs"][dataset_name]; img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+    base_dir = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Baseline_Finetune"; model_save_dir = os.path.join(base_dir, "models")
+    original_model_path = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Original/models/generator.pth"
+    skip_flag = torch.tensor([0], device=device)
+    if rank == 0:
+        if os.path.exists(os.path.join(model_save_dir, "generator.pth")):
+            tqdm.write(f"\n✅ Baseline Finetune SKIPPED: Finetuned model already exists.")
+            skip_flag.fill_(1)
+        elif not os.path.exists(original_model_path):
+            tqdm.write(f"\n❌ Baseline Finetune SKIPPED: Original model not found for finetuning.")
+            skip_flag.fill_(1)
+    if world_size > 1: torch.distributed.broadcast(skip_flag, src=0)
+    if skip_flag.item() == 1:
+        if world_size > 1: torch.distributed.barrier()
+        return 0.0
+    # ... (중간 로직 동일) ...
+    writer, loss_log = None, None
+    if rank == 0:
+        print(f"\n--- Baseline: {dataset_name} Simple Finetuning ---")
+        img_dir, gif_dir = [os.path.join(base_dir, d) for d in ["images", "gifs"]]; os.makedirs(model_save_dir, exist_ok=True); os.makedirs(img_dir, exist_ok=True); os.makedirs(gif_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=os.path.join(base_dir, "runs", "Baseline_Finetune"))
+        loss_log = {"epoch": [], "g_loss": [], "d_loss": [], "g_loss_gan": [], "g_loss_aux": [], "d_loss_gan": [], "d_loss_aux_real": [], "d_loss_aux_fake": []}
+    g_cpu = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size, img_channels); g_cpu.load_state_dict(torch.load(original_model_path, map_location='cpu'))
+    generator = g_cpu.to(device); discriminator = ACGANDiscriminator(config["num_classes"], img_size, img_channels).to(device)
+    initialize_weights(discriminator)
+    if world_size > 1:
+        generator = DDP(generator, device_ids=[rank], find_unused_parameters=True); discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
+    gan_loss_fn, aux_criterion = EfficientGANLoss().to(device), nn.CrossEntropyLoss().to(device)
+    g_optimizer = optim.Adam(generator.parameters(), lr=config["lr_g"]/10, betas=(0.5, 0.999)); d_optimizer = optim.Adam(discriminator.parameters(), lr=config["lr_d"]/10, betas=(0.5, 0.999))
+    epochs = config.get("finetune_epochs", 20)
+    epoch_pbar = tqdm(range(epochs), desc="Baseline Finetune Epochs", position=2, leave=False, disable=(rank != 0))
+    for epoch in epoch_pbar:
+        if sampler is not None: sampler.set_epoch(epoch)
+        epoch_g_loss, epoch_d_loss, epoch_g_loss_gan, epoch_g_loss_aux = 0.0, 0.0, 0.0, 0.0
+        epoch_d_loss_gan, epoch_d_loss_aux_real, epoch_d_loss_aux_fake = 0.0, 0.0, 0.0
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", position=3, leave=False, disable=(rank != 0))
+        for real_imgs, labels in batch_pbar:
+            real_imgs, labels, batch_size = real_imgs.to(device), labels.to(device), real_imgs.size(0)
+            d_optimizer.zero_grad()
+            real_src_pred, real_cls_pred = discriminator(real_imgs)
+            z_d = torch.randn(batch_size, config["latent_dim"], device=device); gen_labels_d = torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            with torch.no_grad(): fake_imgs = generator(z_d, gen_labels_d)
+            fake_src_pred, fake_cls_pred = discriminator(fake_imgs)
+            d_loss_gan, d_loss_aux_real, d_loss_aux_fake = gan_loss_fn.discriminator_loss(real_src_pred, fake_src_pred), aux_criterion(real_cls_pred, labels), aux_criterion(fake_cls_pred, gen_labels_d)
+            d_loss = d_loss_gan + config["aux_loss_weight"] * (d_loss_aux_real + d_loss_aux_fake)
+            d_loss.backward(); d_optimizer.step()
+            g_optimizer.zero_grad()
+            z_g, gen_labels_g = torch.randn(batch_size, config["latent_dim"], device=device), torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            gen_imgs_g = generator(z_g, gen_labels_g)
+            g_src_output, g_cls_output = discriminator(gen_imgs_g)
+            g_loss_gan, g_loss_aux = gan_loss_fn.generator_loss(g_src_output), aux_criterion(g_cls_output, gen_labels_g)
+            g_loss = g_loss_gan + config["aux_loss_weight"] * g_loss_aux
+            g_loss.backward(); g_optimizer.step()
+            epoch_d_loss += d_loss.item(); epoch_g_loss += g_loss.item(); epoch_d_loss_gan += d_loss_gan.item(); epoch_g_loss_gan += g_loss_gan.item(); epoch_d_loss_aux_real += d_loss_aux_real.item(); epoch_d_loss_aux_fake += d_loss_aux_fake.item(); epoch_g_loss_aux += g_loss_aux.item()
+        if rank == 0:
+            num_batches = len(dataloader)
+            avg_g_loss, avg_d_loss = epoch_g_loss / num_batches, epoch_d_loss / num_batches
+            avg_g_gan, avg_g_aux = epoch_g_loss_gan / num_batches, epoch_g_loss_aux / num_batches
+            avg_d_gan, avg_d_aux_r, avg_d_aux_f = epoch_d_loss_gan / num_batches, epoch_d_loss_aux_real / num_batches, epoch_d_loss_aux_fake / num_batches
+            loss_log["epoch"].append(epoch + 1); loss_log["g_loss"].append(avg_g_loss); loss_log["d_loss"].append(avg_d_loss); loss_log["g_loss_gan"].append(avg_g_gan); loss_log["g_loss_aux"].append(avg_g_aux); loss_log["d_loss_gan"].append(avg_d_gan); loss_log["d_loss_aux_real"].append(avg_d_aux_r); loss_log["d_loss_aux_fake"].append(avg_d_aux_f)
+            writer.add_scalar('Baseline_Finetune/Loss/G_Total', avg_g_loss, epoch+1); writer.add_scalar('Baseline_Finetune/Loss/D_Total', avg_d_loss, epoch+1)
+            if (epoch+1) % config["save_every"] == 0 or epoch == epochs - 1:
+                with torch.no_grad():
+                    g_eval = generator.module if world_size > 1 else generator
+                    g_eval.eval(); samples = g_eval(fixed_noise, fixed_labels).detach().cpu(); vutils.save_image(samples, os.path.join(img_dir, f"epoch_{epoch+1:03d}.png"), nrow=10, normalize=True)
+                    writer.add_image('Baseline_Finetune/Generated_Images', vutils.make_grid(samples, nrow=10, normalize=True), epoch+1); g_eval.train()
+    elapsed_time = time.time() - start_time
+    if rank == 0:
+        if writer is not None: writer.close()
+        create_training_gif(img_dir, gif_dir, "Baseline_Finetune")
+        loss_log_path, plot_path = os.path.join(base_dir, "loss_log.json"), os.path.join(base_dir, "loss_plot.png")
+        with open(loss_log_path, 'w') as f: json.dump(loss_log, f, indent=4)
+        save_loss_plot(loss_log_path, plot_path, "Baseline Finetune")
+        g_to_save, d_to_save = (m.module if world_size > 1 else m for m in [generator, discriminator])
+        torch.save(g_to_save.state_dict(), os.path.join(model_save_dir, "generator.pth")); torch.save(d_to_save.state_dict(), os.path.join(model_save_dir, "discriminator.pth"))
+        tqdm.write(f"✅ Baseline Finetune 완료. (소요 시간: {elapsed_time:.2f}초)")
+    if world_size > 1: torch.distributed.barrier()
+    return elapsed_time
+
+def run_stage1_2(config, dataloader, sampler, soft_label_target, rank, world_size, device, fixed_noise, fixed_labels):
+    start_time = time.time()
+    dataset_name = config["current_dataset_name"]; d_config = config["dataset_configs"][dataset_name]; img_size, img_channels = d_config["img_size"], d_config["img_channels"]; forget_label, alpha = config["forget_label"], config["alpha"]
+    unlearning_base_dir = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Unlearning_soft_target_{soft_label_target:.1f}"
+    
+    writer, loss_log, skip_flag = None, None, torch.tensor([0], device=device)
+    
+    if rank == 0:
+        model_dir = os.path.join(unlearning_base_dir, "models")
+        final_gen_path = os.path.join(model_dir, "generator_step1.pth")
+        final_disc_path = os.path.join(model_dir, "discriminator_step1.pth")
+        if os.path.exists(final_gen_path) and os.path.exists(final_disc_path):
+            tqdm.write(f"\n✅ Stage 1-2 SKIPPED: Step1 models already exist for soft_target={soft_label_target:.2f}")
+            skip_flag.fill_(1)
+            
+    if world_size > 1: torch.distributed.broadcast(skip_flag, src=0)
+    if skip_flag.item() == 1:
+        if world_size > 1: torch.distributed.barrier()
+        return 0.0
+        
+    # ... (중간 로직 동일) ...
+    if rank == 0:
+        print(f"\n--- Stage 1-2: D 소프트 망각 (soft_target={soft_label_target:.2f}) ---")
+        model_dir, img_dir = [os.path.join(unlearning_base_dir, d) for d in ["models", "stage1_2_images"]]; os.makedirs(model_dir, exist_ok=True); os.makedirs(img_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=os.path.join(unlearning_base_dir, "runs", "Stage_1-2"))
+        loss_log = {"epoch": [], "d_loss": [], "g_loss": [], "g_gan": [], "g_aux": [], "d_gan_real_nf": [], "d_gan_fake": [], "d_gan_forget": [], "d_aux_real": [], "d_aux_fake": []}
+
+    generator = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size, img_channels).to(device); discriminator = ACGANDiscriminator(config["num_classes"], img_size, img_channels).to(device)
+    initialize_weights(generator); initialize_weights(discriminator)
+    if world_size > 1:
+        generator = DDP(generator, device_ids=[rank], find_unused_parameters=True); discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
+    gan_loss_fn, aux_criterion = EfficientGANLoss().to(device), nn.CrossEntropyLoss().to(device)
+    g_optimizer = torch.optim.Adam(generator.parameters(), lr=config["lr_g"], betas=(0.5, 0.999)); d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=config["lr_d"], betas=(0.5, 0.999))
+    epochs = config["step1_epochs"]
+    epoch_pbar = tqdm(range(epochs), desc=f"Stage 1-2 Epochs", position=2, leave=False, disable=(rank != 0))
+    for epoch in epoch_pbar:
+        if sampler is not None: sampler.set_epoch(epoch)
+        epoch_d_loss, epoch_g_loss, epoch_g_gan, epoch_g_aux = 0.0, 0.0, 0.0, 0.0
+        epoch_d_gan_rnf, epoch_d_gan_fk, epoch_d_gan_fgt = 0.0, 0.0, 0.0
+        epoch_d_aux_r, epoch_d_aux_f = 0.0, 0.0
+
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", position=3, leave=False, disable=(rank != 0))
+        for real_imgs, labels in batch_pbar:
+            batch_size = real_imgs.size(0); real_imgs, labels = real_imgs.to(device), labels.to(device); d_optimizer.zero_grad()
+            
+            real_src_pred, real_cls_pred = discriminator(real_imgs)
+            
+            z_d = torch.randn(batch_size, config["latent_dim"], device=device)
+            gen_labels_d = torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            with torch.no_grad(): fake_imgs = generator(z_d, gen_labels_d)
+            
+            fake_src_pred, fake_cls_pred = discriminator(fake_imgs)
+
+            d_gan_fake = torch.mean(F.relu(1.0 + fake_src_pred)); d_loss_gan = d_gan_fake.clone()
+            forget_mask = (labels == forget_label)
+            d_gan_real_nf, d_gan_forget = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            if (~forget_mask).any(): d_gan_real_nf = torch.mean(F.relu(1.0 - real_src_pred[~forget_mask])); d_loss_gan += d_gan_real_nf
+            if forget_mask.any():
+                pred_forget = real_src_pred[forget_mask]
+                d_gan_forget = alpha * torch.mean((1-soft_label_target)*F.relu(1+pred_forget) + soft_label_target*F.relu(1-pred_forget))
+                d_loss_gan += d_gan_forget
+            
+            d_loss_aux_real = aux_criterion(real_cls_pred, labels)
+            d_loss_aux_fake = aux_criterion(fake_cls_pred, gen_labels_d)
+            d_loss_aux = d_loss_aux_real + d_loss_aux_fake
+            
+            d_loss = d_loss_gan + config["aux_loss_weight"] * d_loss_aux
+            d_loss.backward(); d_optimizer.step()
+            
+            epoch_d_loss += d_loss.item(); epoch_d_gan_rnf += d_gan_real_nf.item(); epoch_d_gan_fk += d_gan_fake.item(); epoch_d_gan_fgt += d_gan_forget.item()
+            epoch_d_aux_r += d_loss_aux_real.item(); epoch_d_aux_f += d_loss_aux_fake.item()
+
+            g_optimizer.zero_grad()
+            z_g, gen_labels_g = torch.randn(batch_size, config["latent_dim"], device=device), torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            gen_imgs_g = generator(z_g, gen_labels_g)
+            g_src_output, g_cls_output = discriminator(gen_imgs_g)
+            g_loss_gan, g_loss_aux = gan_loss_fn.generator_loss(g_src_output), config["aux_loss_weight"] * aux_criterion(g_cls_output, gen_labels_g)
+            g_loss = g_loss_gan + g_loss_aux
+            g_loss.backward(); g_optimizer.step()
+            epoch_g_loss += g_loss.item(); epoch_g_gan += g_loss_gan.item(); epoch_g_aux += g_loss_aux.item()
+            
+        if rank == 0:
+            num_batches = len(dataloader)
+            avg_d, avg_g = epoch_d_loss/num_batches, epoch_g_loss/num_batches
+            avg_g_gan, avg_g_aux = epoch_g_gan/num_batches, epoch_g_aux/num_batches
+            avg_d_gan_rnf, avg_d_gan_fk, avg_d_gan_fgt = epoch_d_gan_rnf/num_batches, epoch_d_gan_fk/num_batches, epoch_d_gan_fgt/num_batches
+            avg_d_aux_r, avg_d_aux_f = epoch_d_aux_r/num_batches, epoch_d_aux_f/num_batches
+            
+            loss_log["epoch"].append(epoch + 1); loss_log["d_loss"].append(avg_d); loss_log["g_loss"].append(avg_g)
+            loss_log["g_gan"].append(avg_g_gan); loss_log["g_aux"].append(avg_g_aux); loss_log["d_gan_real_nf"].append(avg_d_gan_rnf)
+            loss_log["d_gan_fake"].append(avg_d_gan_fk); loss_log["d_gan_forget"].append(avg_d_gan_fgt)
+            loss_log["d_aux_real"].append(avg_d_aux_r); loss_log["d_aux_fake"].append(avg_d_aux_f)
+            
+            writer.add_scalar('Stage1-2/Loss/G_Total', avg_g, epoch + 1); writer.add_scalar('Stage1-2/Loss/G_GAN', avg_g_gan, epoch + 1); writer.add_scalar('Stage1-2/Loss/G_Aux', avg_g_aux, epoch + 1)
+            writer.add_scalar('Stage1-2/Loss/D_Total', avg_d, epoch + 1); writer.add_scalar('Stage1-2/Loss/D_GAN_Real_NonForget', avg_d_gan_rnf, epoch + 1)
+            writer.add_scalar('Stage1-2/Loss/D_GAN_Fake', avg_d_gan_fk, epoch + 1); writer.add_scalar('Stage1-2/Loss/D_GAN_Forget', avg_d_gan_fgt, epoch + 1)
+            writer.add_scalar('Stage1-2/Loss/D_Aux_Real', avg_d_aux_r, epoch + 1); writer.add_scalar('Stage1-2/Loss/D_Aux_Fake', avg_d_aux_f, epoch + 1)
+
+            if (epoch + 1) % config["save_every"] == 0 or epoch == epochs - 1:
+                with torch.no_grad():
+                    g_eval = generator.module if world_size > 1 else generator
+                    g_eval.eval(); samples = g_eval(fixed_noise, fixed_labels).detach().cpu(); vutils.save_image(samples, os.path.join(img_dir, f"epoch_{epoch+1:03d}.png"), nrow=10, normalize=True)
+                    writer.add_image(f'Stage1-2/Generated_Images', vutils.make_grid(samples, nrow=10, normalize=True), epoch + 1); g_eval.train()
+    elapsed_time = time.time() - start_time
+    if rank == 0:
+        if writer is not None: writer.close()
+        loss_log_path, plot_path = os.path.join(unlearning_base_dir, "loss_log_stage1_2.json"), os.path.join(unlearning_base_dir, "loss_plot_stage1_2.png")
+        with open(loss_log_path, 'w') as f: json.dump(loss_log, f, indent=4)
+        save_loss_plot(loss_log_path, plot_path, f"Stage 1-2 (soft_target={soft_label_target:.2f})")
+        model_dir = os.path.join(unlearning_base_dir, "models")
+        g_to_save, d_to_save = (m.module if world_size > 1 else m for m in [generator, discriminator])
+        torch.save(g_to_save.state_dict(), os.path.join(model_dir, "generator_step1.pth"))
+        torch.save(d_to_save.state_dict(), os.path.join(model_dir, "discriminator_step1.pth"))
+        tqdm.write(f"✅ Stage 1-2 완료. (소요 시간: {elapsed_time:.2f}초)")
+    if world_size > 1: torch.distributed.barrier()
+    return elapsed_time
+
+def run_stage2(config, dataloader, sampler, soft_label_target, rank, world_size, device, fixed_noise, fixed_labels):
+    start_time = time.time()
+    dataset_name = config["current_dataset_name"]; d_config = config["dataset_configs"][dataset_name]; img_size, img_channels = d_config["img_size"], d_config["img_channels"]; forget_label, alpha, beta = config["forget_label"], config["alpha"], config["beta"]
+    unlearning_base_dir = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Unlearning_soft_target_{soft_label_target:.1f}"
+    
+    model_dir = os.path.join(unlearning_base_dir, "models"); final_gen_path, final_disc_path = os.path.join(model_dir, f"generator_final_soft_{soft_label_target:.1f}.pth"), os.path.join(model_dir, f"discriminator_final_soft_{soft_label_target:.1f}.pth")
+    original_gen_path, stage1_2_disc_path = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/Original/models/generator.pth", os.path.join(unlearning_base_dir, "models", "discriminator_step1.pth")
+    
+    writer, loss_log, skip_flag = None, None, torch.tensor([0], device=device)
+    
+    if rank == 0:
+        if os.path.exists(final_gen_path) and os.path.exists(final_disc_path):
+            tqdm.write(f"\n✅ Stage 2 SKIPPED: Final models already exist for soft_target={soft_label_target:.2f}"); skip_flag.fill_(1)
+        elif not os.path.exists(original_gen_path) or not os.path.exists(stage1_2_disc_path):
+            tqdm.write(f"\n❌ Error: Stage 2 pre-requisite models not found for soft_target={soft_label_target:.2f}. Skipping."); skip_flag.fill_(1)
+            
+    if world_size > 1: torch.distributed.broadcast(skip_flag, src=0)
+    if skip_flag.item() == 1:
+        if world_size > 1: torch.distributed.barrier()
+        return 0.0
+        
+    # ... (중간 로직 동일) ...
+    if rank == 0:
+        print(f"\n--- Stage 2: D&G 미세 조정 (soft_target={soft_label_target:.2f}) ---")
+        img_dir = os.path.join(unlearning_base_dir, "stage2_images"); os.makedirs(img_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=os.path.join(unlearning_base_dir, "runs", "Stage_2"))
+        loss_log = {"epoch": [], "d_loss": [], "g_loss": [], "g_gan_normal": [], "g_gan_forget": [], "g_aux": [], "d_gan_real_nf": [], "d_gan_fake": [], "d_gan_forget": []}
+
+    g_cpu = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size, img_channels)
+    d_cpu = ACGANDiscriminator(config["num_classes"], img_size, img_channels)
+    g_cpu.load_state_dict(torch.load(original_gen_path, map_location='cpu', weights_only=True))
+    d_cpu.load_state_dict(torch.load(stage1_2_disc_path, map_location='cpu', weights_only=True))
+    generator, discriminator = g_cpu.to(device), d_cpu.to(device)
+    
+    if world_size > 1:
+        generator = DDP(generator, device_ids=[rank], find_unused_parameters=True); discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
+    gan_loss_fn, aux_criterion = EfficientGANLoss().to(device), nn.CrossEntropyLoss().to(device)
+    g_optimizer = torch.optim.Adam(generator.parameters(), lr=config["lr_g"], betas=(0.5, 0.999)); d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=config["lr_d"], betas=(0.5, 0.999))
+    epochs = config["step2_epochs"]
+    epoch_pbar = tqdm(range(epochs), desc=f"Stage 2 Epochs", position=2, leave=False, disable=(rank != 0))
+    for epoch in epoch_pbar:
+        if sampler is not None: sampler.set_epoch(epoch)
+        epoch_d_loss, epoch_g_loss, epoch_g_gan_n, epoch_g_gan_f, epoch_g_aux = 0.0, 0.0, 0.0, 0.0, 0.0
+        epoch_d_gan_rnf, epoch_d_gan_fk, epoch_d_gan_fgt = 0.0, 0.0, 0.0
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", position=3, leave=False, disable=(rank != 0))
+        for real_imgs, labels in batch_pbar:
+            batch_size = real_imgs.size(0); real_imgs, labels = real_imgs.to(device), labels.to(device); d_optimizer.zero_grad()
+            real_src_pred, _ = discriminator(real_imgs)
+            z_d = torch.randn(batch_size, config["latent_dim"], device=device)
+            with torch.no_grad(): fake_imgs = generator(z_d, torch.randint(0, config["num_classes"], (batch_size,), device=device))
+            fake_src_pred, _ = discriminator(fake_imgs)
+            d_gan_fake = torch.mean(F.relu(1.0 + fake_src_pred)); d_loss_gan = d_gan_fake.clone()
+            forget_mask_d = (labels == forget_label)
+            d_gan_real_nf, d_gan_forget = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            if (~forget_mask_d).any(): d_gan_real_nf = torch.mean(F.relu(1.0 - real_src_pred[~forget_mask_d])); d_loss_gan += d_gan_real_nf
+            if forget_mask_d.any():
+                pred_forget_d = real_src_pred[forget_mask_d]
+                d_gan_forget = alpha * torch.mean((1-soft_label_target)*F.relu(1+pred_forget_d) + soft_label_target*F.relu(1-pred_forget_d))
+                d_loss_gan += d_gan_forget
+            d_loss_gan.backward(); d_optimizer.step(); epoch_d_loss += d_loss_gan.item(); epoch_d_gan_rnf += d_gan_real_nf.item(); epoch_d_gan_fk += d_gan_fake.item(); epoch_d_gan_fgt += d_gan_forget.item()
+            g_optimizer.zero_grad()
+            z_g, gen_labels_g = torch.randn(batch_size, config["latent_dim"], device=device), torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            gen_imgs_g = generator(z_g, gen_labels_g)
+            g_src_output, g_cls_output = discriminator(gen_imgs_g)
+            g_loss_gan = torch.tensor(0.0, device=device); normal_mask_g, forget_mask_g = (gen_labels_g != forget_label), (gen_labels_g == forget_label)
+            g_gan_normal, g_gan_forget = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            if normal_mask_g.any(): g_gan_normal = gan_loss_fn.generator_loss(g_src_output[normal_mask_g]); g_loss_gan += g_gan_normal
+            if forget_mask_g.any(): g_gan_forget = beta * torch.mean(g_src_output[forget_mask_g]); g_loss_gan += g_gan_forget
+            g_loss_aux = config["aux_loss_weight"] * aux_criterion(g_cls_output, gen_labels_g)
+            g_loss = g_loss_gan + g_loss_aux; g_loss.backward(); g_optimizer.step()
+            epoch_g_loss += g_loss.item(); epoch_g_gan_n += g_gan_normal.item(); epoch_g_gan_f += g_gan_forget.item(); epoch_g_aux += g_loss_aux.item()
+        if rank == 0:
+            num_batches = len(dataloader)
+            avg_d, avg_g = epoch_d_loss/num_batches, epoch_g_loss/num_batches
+            avg_g_gan_n, avg_g_gan_f, avg_g_aux = epoch_g_gan_n/num_batches, epoch_g_gan_f/num_batches, epoch_g_aux/num_batches
+            avg_d_gan_rnf, avg_d_gan_fk, avg_d_gan_fgt = epoch_d_gan_rnf/num_batches, epoch_d_gan_fk/num_batches, epoch_d_gan_fgt/num_batches
+            loss_log["epoch"].append(epoch + 1); loss_log["d_loss"].append(avg_d); loss_log["g_loss"].append(avg_g)
+            loss_log["g_gan_normal"].append(avg_g_gan_n); loss_log["g_gan_forget"].append(avg_g_gan_f); loss_log["g_aux"].append(avg_g_aux)
+            loss_log["d_gan_real_nf"].append(avg_d_gan_rnf); loss_log["d_gan_fake"].append(avg_d_gan_fk); loss_log["d_gan_forget"].append(avg_d_gan_fgt)
+            writer.add_scalar('Stage2/Loss/G_Total', avg_g, epoch + 1); writer.add_scalar('Stage2/Loss/G_GAN_Normal', avg_g_gan_n, epoch + 1); writer.add_scalar('Stage2/Loss/G_GAN_Forget', avg_g_gan_f, epoch + 1); writer.add_scalar('Stage2/Loss/G_Aux', avg_g_aux, epoch + 1)
+            writer.add_scalar('Stage2/Loss/D_Total', avg_d, epoch + 1); writer.add_scalar('Stage2/Loss/D_GAN_Real_NonForget', avg_d_gan_rnf, epoch + 1); writer.add_scalar('Stage2/Loss/D_GAN_Fake', avg_d_gan_fk, epoch + 1); writer.add_scalar('Stage2/Loss/D_GAN_Forget', avg_d_gan_fgt, epoch + 1)
+            if (epoch + 1) % config["save_every"] == 0 or epoch == epochs - 1:
+                with torch.no_grad():
+                    g_eval = generator.module if world_size > 1 else generator
+                    g_eval.eval(); samples = g_eval(fixed_noise, fixed_labels).detach().cpu(); vutils.save_image(samples, os.path.join(img_dir, f"epoch_{epoch+1:03d}.png"), nrow=10, normalize=True)
+                    writer.add_image(f'Stage2/Generated_Images', vutils.make_grid(samples, nrow=10, normalize=True), epoch + 1); g_eval.train()
+    elapsed_time = time.time() - start_time
+    if rank == 0:
+        if writer is not None: writer.close()
+        loss_log_path, plot_path = os.path.join(unlearning_base_dir, "loss_log_stage2.json"), os.path.join(unlearning_base_dir, "loss_plot_stage2.png")
+        with open(loss_log_path, 'w') as f: json.dump(loss_log, f, indent=4)
+        save_loss_plot(loss_log_path, plot_path, f"Stage 2 (soft_target={soft_label_target:.2f})")
+        model_dir = os.path.join(unlearning_base_dir, "models")
+        g_to_save, d_to_save = (m.module if world_size > 1 else m for m in [generator, discriminator])
+        torch.save(g_to_save.state_dict(), final_gen_path); torch.save(d_to_save.state_dict(), final_disc_path)
+        tqdm.write(f"✅ Stage 2 완료. (소요 시간: {elapsed_time:.2f}초)")
+    if world_size > 1: torch.distributed.barrier()
+    return elapsed_time
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\acgan\utils.py ---
+import os
+import glob
+from PIL import Image
+import matplotlib.pyplot as plt
+import json
+
+def save_loss_plot(loss_log_path, output_path, model_name):
+    """
+    loss_log.json 파일을 읽어 손실 곡선 그래프를 저장합니다.
+    """
+    try:
+        with open(loss_log_path, 'r') as f:
+            loss_log = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print(f"Warning: Could not read or decode loss log file at {loss_log_path}. Skipping plot generation.")
+        return
+
+    plt.figure(figsize=(12, 8))
+    
+    # Generator Loss
+    if "g_loss" in loss_log and "epoch" in loss_log:
+        plt.subplot(2, 1, 1)
+        plt.plot(loss_log["epoch"], loss_log["g_loss"], label="Total G Loss")
+        if "g_loss_gan" in loss_log:
+            plt.plot(loss_log["epoch"], loss_log["g_loss_gan"], label="G GAN Loss", linestyle='--')
+        if "g_loss_aux" in loss_log:
+            plt.plot(loss_log["epoch"], loss_log["g_loss_aux"], label="G Aux Loss", linestyle=':')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title(f"Generator Loss: {model_name}")
+        plt.legend()
+        plt.grid(True)
+
+    # Discriminator Loss
+    if "d_loss" in loss_log and "epoch" in loss_log:
+        plt.subplot(2, 1, 2)
+        plt.plot(loss_log["epoch"], loss_log["d_loss"], label="Total D Loss")
+        if "d_loss_gan" in loss_log:
+            plt.plot(loss_log["epoch"], loss_log["d_loss_gan"], label="D GAN Loss", linestyle='--')
+        if "d_loss_aux_real" in loss_log:
+            plt.plot(loss_log["epoch"], loss_log["d_loss_aux_real"], label="D Aux Real Loss", linestyle=':')
+        if "d_loss_aux_fake" in loss_log:
+            plt.plot(loss_log["epoch"], loss_log["d_loss_aux_fake"], label="D Aux Fake Loss", linestyle='-.')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title(f"Discriminator Loss: {model_name}")
+        plt.legend()
+        plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Saved loss curve to {output_path}")
+
+def create_training_gif(image_dir, output_path, gif_name):
+    """
+    지정된 디렉토리의 PNG 이미지들로 GIF를 생성합니다.
+    """
+    frames = []
+    # glob.glob으로 파일 목록을 가져온 후, 정렬하여 순서를 보장합니다.
+    file_paths = sorted(glob.glob(os.path.join(image_dir, "epoch_*.png")))
+    for p in file_paths:
+        try:
+            frames.append(Image.open(p))
+        except IOError:
+            print(f"Warning: Could not open image file {p}. Skipping.")
+    
+    if frames:
+        full_gif_path = os.path.join(output_path, f"{gif_name}_training.gif")
+        frames[0].save(full_gif_path, save_all=True, append_images=frames[1:], duration=500, loop=0)
+        print(f"Saved training GIF to {full_gif_path}")
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\acgan\__init__.py ---
+# 이 파일은 'acgan' 디렉토리를 파이썬 패키지로 만들어줍니다.
+# 비어 있어도 정상적으로 작동합니다.
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\config.json ---
+{
+    "latent_dim": 100,
+    "num_classes": 10,
+    "label_embedding_dim_g": 50,
+    "batch_size": 512,
+    "lr_g": 2e-5,
+    "lr_d": 4e-5,
+    "aux_loss_weight": 1.0,
+    "original_epochs": 500,
+    "step1_epochs": 500,
+    "step2_epochs": 50,
+    "save_every": 5,
+    "alpha": 1.0,
+    "beta": 1.0,
+    "forget_label": 3,
+    "soft_label_target_list": [0.1],
+    "dataset_configs": {
+        "MNIST": {"img_channels": 1, "img_size": 28, "enabled": true },
+        "FashionMNIST": {"img_channels": 1, "img_size": 28, "enabled": true},
+        "SVHN": {"img_channels": 3, "img_size": 32, "enabled": true},
+        "CIFAR10": {"img_channels": 3, "img_size": 32, "enabled": true},
+        "STL10": {"img_channels": 3, "img_size": 96, "enabled": false}
+    },
+    "run_stage1_1_flag": true,
+    "run_stage1_2_flag": true,
+    "run_stage2_flag": true,
+    "run_baseline_retrain_flag": true,
+    "run_baseline_finetune_flag": true,
+    "finetune_epochs": 50,
+    "enable_profiler_stage1_1": false,
+    "enable_profiler_stage1_2": false,
+    "enable_profiler_stage2": false
+}
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\evaluate.py ---
+# evaluate.py
+
+import torch
+import json
+import os
+import argparse
+from tqdm import tqdm
+import numpy as np
+
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.kid import KernelInceptionDistance
+from acgan.model import ACGANGenerator
+from acgan.dataset import get_dataloader
+
+@torch.no_grad()
+def calculate_metrics_for_scenario(generator, config, dataloader, scenario, device, num_images=5000):
+    print(f"\n--- Scenario: {scenario.replace('_', ' ').title()} ---")
+    inception = InceptionScore().to(device)
+    fid = FrechetInceptionDistance(feature=2048).to(device)
+    kid = KernelInceptionDistance(subset_size=min(1000, num_images // 5), feature=2048).to(device)
+    
+    # --- 수정된 부분 시작 ---
+    d_config = config["dataset_configs"][config["current_dataset_name"]]
+    img_channels = d_config["img_channels"]
+    # --- 수정된 부분 끝 ---
+
+    print("Processing real images for this scenario...")
+    processed_real_images = 0
+    for real_imgs, _ in tqdm(dataloader, desc="Real Images"):
+        real_imgs_uint8 = ((real_imgs + 1) / 2 * 255).to(torch.uint8).to(device)
+        
+        # --- 수정된 부분 시작 ---
+        # 1채널 이미지를 3채널로 복제
+        if img_channels == 1:
+            real_imgs_uint8 = real_imgs_uint8.repeat(1, 3, 1, 1)
+        # --- 수정된 부분 끝 ---
+            
+        fid.update(real_imgs_uint8, real=True); kid.update(real_imgs_uint8, real=True)
+        processed_real_images += real_imgs.size(0)
+        if processed_real_images >= num_images: break
+        
+    latent_dim, num_classes, forget_label = config["latent_dim"], config["num_classes"], config["forget_label"]
+    batch_size = 64
+    labels_to_generate = []
+    if scenario == 'all_labels': labels_to_generate = list(range(num_classes))
+    elif scenario == 'exclude_target': labels_to_generate = [l for l in range(num_classes) if l != forget_label]
+    elif scenario == 'target_only': labels_to_generate = [forget_label]
+    if not labels_to_generate: return {}
+    print(f"Generating {num_images} fake images for labels: {labels_to_generate}...")
+    generated_count = 0
+    pbar = tqdm(total=num_images, desc=f"Fake Images ({scenario})")
+    while generated_count < num_images:
+        z = torch.randn(batch_size, latent_dim, device=device)
+        gen_labels_np = np.random.choice(labels_to_generate, size=batch_size)
+        gen_labels = torch.from_numpy(gen_labels_np).to(device)
+        fake_imgs = generator(z, gen_labels)
+        fake_imgs_uint8 = ((fake_imgs + 1) / 2 * 255).to(torch.uint8)
+        
+        # --- 수정된 부분 시작 ---
+        # 생성된 가짜 이미지도 1채널이면 3채널로 복제
+        if img_channels == 1:
+            fake_imgs_uint8 = fake_imgs_uint8.repeat(1, 3, 1, 1)
+        # --- 수정된 부분 끝 ---
+
+        inception.update(fake_imgs_uint8); fid.update(fake_imgs_uint8, real=False); kid.update(fake_imgs_uint8, real=False)
+        generated_count += batch_size
+        pbar.update(batch_size)
+    pbar.close()
+    is_mean, is_std = inception.compute(); fid_score = fid.compute(); kid_mean, kid_std = kid.compute()
+    print(f"Results for '{scenario}':")
+    print(f"  Inception Score (IS): {is_mean:.4f} ± {is_std:.4f}")
+    print(f"  Frechet Inception Distance (FID): {fid_score:.4f}")
+    print(f"  Kernel Inception Distance (KID): {kid_mean:.4f} ± {kid_std:.4f}")
+
+def main(args):
+    with open(args.config, 'r') as f: config = json.load(f)
+    dataset_name, exp_type = args.dataset, args.type
+    
+    # --- 수정된 부분 시작 ---
+    config["current_dataset_name"] = dataset_name # 현재 데이터셋 이름을 config에 추가
+    base_path = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}"
+    # --- 수정된 부분 끝 ---
+    
+    model_filename = "generator.pth"
+    
+    if exp_type == 'unlearning_final':
+        if args.soft_target is None: raise ValueError("--soft_target is required for 'unlearning_final' type.")
+        soft_target = args.soft_target
+        exp_dir = os.path.join(base_path, f"Unlearning_soft_target_{soft_target:.1f}")
+        model_filename = f"generator_final_soft_{soft_target:.1f}.pth"
+    elif exp_type == 'unlearning_step1':
+        if args.soft_target is None: raise ValueError("--soft_target is required for 'unlearning_step1' type.")
+        soft_target = args.soft_target
+        exp_dir = os.path.join(base_path, f"Unlearning_soft_target_{soft_target:.1f}")
+        model_filename = "generator_step1.pth"
+    elif exp_type == 'original': exp_dir = os.path.join(base_path, "Original")
+    elif exp_type == 'retrain': exp_dir = os.path.join(base_path, "Baseline_Retrain")
+    elif exp_type == 'finetune': exp_dir = os.path.join(base_path, "Baseline_Finetune")
+    else: raise ValueError(f"Invalid experiment type: {exp_type}")
+
+    model_path = os.path.join(exp_dir, "models", model_filename)
+    if not os.path.exists(model_path): raise FileNotFoundError(f"Model not found at: {model_path}\nPlease check if the experiment was run.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Evaluating model: {model_path}"); print(f"Using device: {device}")
+    
+    d_config = config["dataset_configs"][dataset_name]
+    generator = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size=d_config["img_size"], img_channels=d_config["img_channels"]).to(device)
+    generator.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    generator.eval()
+    
+    dataloader, _ = get_dataloader(dataset_name, d_config["img_size"], d_config["img_channels"], 64, 1, 0)
+    
+    for scenario in ['all_labels', 'exclude_target', 'target_only']:
+        calculate_metrics_for_scenario(generator, config, dataloader, scenario, device, num_images=args.num_images)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Evaluate a specific ACGAN model.")
+    parser.add_argument('--dataset', type=str, required=True, help='Dataset name to evaluate (e.g., SVHN).')
+    parser.add_argument('--type', type=str, required=True, choices=['original', 'retrain', 'finetune', 'unlearning_step1', 'unlearning_final'], help='Type of the experiment to evaluate.')
+    parser.add_argument('--soft_target', type=float, help="Soft target value, required for 'unlearning_step1' and 'unlearning_final' types.")
+    parser.add_argument('--config', type=str, default='config.json', help='Path to the configuration file.')
+    parser.add_argument('--num_images', type=int, default=5000, help='Number of images for evaluation.')
+    
+    args = parser.parse_args()
+    main(args)
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\evaluate_all.py ---
+# evaluate_all.py
+
+import torch
+import json
+import os
+import argparse
+import csv
+from tqdm import tqdm
+import numpy as np
+import re
+
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.kid import KernelInceptionDistance
+from acgan.model import ACGANGenerator
+from acgan.dataset import get_dataloader
+
+@torch.no_grad()
+def calculate_metrics_for_scenario(generator, config, img_channels, dataloader, scenario, device, num_images=5000):
+    inception = InceptionScore().to(device)
+    fid = FrechetInceptionDistance(feature=2048).to(device)
+    kid = KernelInceptionDistance(subset_size=min(1000, num_images // 5), feature=2048).to(device)
+    
+    processed_real_images = 0
+    for real_imgs, _ in dataloader:
+        real_imgs_uint8 = ((real_imgs + 1) / 2 * 255).to(torch.uint8).to(device)
+        
+        if img_channels == 1:
+            real_imgs_uint8 = real_imgs_uint8.repeat(1, 3, 1, 1)
+            
+        fid.update(real_imgs_uint8, real=True); kid.update(real_imgs_uint8, real=True)
+        processed_real_images += real_imgs.size(0)
+        if processed_real_images >= num_images: break
+        
+    latent_dim, num_classes, forget_label = config["latent_dim"], config["num_classes"], config["forget_label"]
+    batch_size = 64
+    labels_to_generate = []
+    if scenario == 'all_labels': labels_to_generate = list(range(num_classes))
+    elif scenario == 'exclude_target': labels_to_generate = [l for l in range(num_classes) if l != forget_label]
+    elif scenario == 'target_only': labels_to_generate = [forget_label]
+    if not labels_to_generate: return {}
+    
+    generated_count = 0
+    while generated_count < num_images:
+        z = torch.randn(batch_size, latent_dim, device=device)
+        gen_labels_np = np.random.choice(labels_to_generate, size=batch_size)
+        gen_labels = torch.from_numpy(gen_labels_np).to(device)
+        fake_imgs = generator(z, gen_labels)
+        fake_imgs_uint8 = ((fake_imgs + 1) / 2 * 255).to(torch.uint8)
+        
+        if img_channels == 1:
+            fake_imgs_uint8 = fake_imgs_uint8.repeat(1, 3, 1, 1)
+
+        inception.update(fake_imgs_uint8); fid.update(fake_imgs_uint8, real=False); kid.update(fake_imgs_uint8, real=False)
+        generated_count += batch_size
+        
+    is_mean, is_std = inception.compute(); fid_score = fid.compute(); kid_mean, kid_std = kid.compute()
+    return {"is_mean": round(is_mean.item(), 4), "is_std": round(is_std.item(), 4), "fid": round(fid_score.item(), 4), "kid_mean": round(kid_mean.item(), 4), "kid_std": round(kid_std.item(), 4)}
+
+def find_experiments(root_dir, config):
+    experiments = []
+    enabled_datasets = {k for k, v in config["dataset_configs"].items() if v.get("enabled", False)}
+    for dataset_name in enabled_datasets:
+        dataset_path = os.path.join(root_dir, f"ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}")
+        if not os.path.isdir(dataset_path): continue
+        for exp_dir_name in os.listdir(dataset_path):
+            exp_path = os.path.join(dataset_path, exp_dir_name)
+            model_dir = os.path.join(exp_path, "models")
+            if not os.path.isdir(model_dir): continue
+            
+            base_models = {"Original": "Original", "Baseline_Retrain": "Retrain", "Baseline_Finetune": "Finetune"}
+            if exp_dir_name in base_models:
+                model_path = os.path.join(model_dir, "generator.pth")
+                if os.path.exists(model_path):
+                    experiments.append({"dataset": dataset_name, "type": base_models[exp_dir_name], "soft_target": "N/A", "model_path": model_path})
+
+            elif exp_dir_name.startswith("Unlearning_soft_target_"):
+                try:
+                    # --- 수정된 부분 시작 ---
+                    soft_target_match = re.search(r'(\d+\.\d+|\d+)', exp_dir_name)
+                    if not soft_target_match: continue
+                    # soft_target 변수에 값을 할당
+                    soft_target = float(soft_target_match.group(1))
+                    
+                    step1_model_path = os.path.join(model_dir, "generator_step1.pth")
+                    if os.path.exists(step1_model_path):
+                        experiments.append({"dataset": dataset_name, "type": "Unlearning_Step1", "soft_target": soft_target, "model_path": step1_model_path})
+
+                    # final_model_path를 만들 때 올바른 변수(soft_target) 사용
+                    final_model_path = os.path.join(model_dir, f"generator_final_soft_{soft_target:.1f}.pth")
+                    if os.path.exists(final_model_path):
+                        experiments.append({"dataset": dataset_name, "type": "Unlearning_Final", "soft_target": soft_target, "model_path": final_model_path})
+                    # --- 수정된 부분 끝 ---
+                except (AttributeError, ValueError):
+                    continue
+    return experiments
+
+def main(args):
+    with open(args.config, 'r') as f: config = json.load(f)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    experiments_to_run = find_experiments('outputs', config)
+    if not experiments_to_run:
+        print("No trained models found in 'outputs' directory for enabled datasets. Nothing to evaluate.")
+        return
+        
+    all_results = []
+    scenarios = ['all_labels', 'exclude_target', 'target_only']
+    
+    dataloaders = {}
+    for exp in experiments_to_run:
+        dataset_name = exp["dataset"]
+        if dataset_name not in dataloaders:
+            d_config = config["dataset_configs"][dataset_name]
+            dataloader, _ = get_dataloader(dataset_name, d_config["img_size"], d_config["img_channels"], 64, 1, 0, exclude_label=None)
+            dataloaders[dataset_name] = dataloader
+
+    exp_pbar = tqdm(experiments_to_run, desc="Total Experiments")
+    for exp in exp_pbar:
+        dataset_name = exp["dataset"]
+        exp_pbar.set_description(f"Evaluating [{dataset_name} - {exp['type']} - ST: {exp['soft_target']}]")
+        
+        d_config = config["dataset_configs"][dataset_name]
+        dataloader = dataloaders[dataset_name]
+        
+        generator = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size=d_config["img_size"], img_channels=d_config["img_channels"]).to(device)
+        generator.load_state_dict(torch.load(exp["model_path"], map_location=device, weights_only=True))
+        generator.eval()
+        
+        for scenario in scenarios:
+            tqdm.write(f"  > Scenario: {scenario}")
+            metrics = calculate_metrics_for_scenario(generator, config, d_config["img_channels"], dataloader, scenario, device, num_images=args.num_images)
+            if metrics:
+                all_results.append({"dataset": dataset_name, "type": exp['type'], "soft_target": exp['soft_target'], "scenario": scenario, **metrics})
+
+    if not all_results:
+        print("\nEvaluation completed, but no results were generated.")
+        return
+    try:
+        fieldnames = sorted(list(set(k for res in all_results for k in res.keys())))
+        
+        with open(args.output, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\n✅ All evaluations complete. Results saved to '{args.output}'")
+    except (IOError, IndexError) as e:
+        print(f"Error: Could not write to file '{args.output}' or no results to write. Details: {e}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Evaluate all trained models found in 'outputs' and save to CSV.")
+    parser.add_argument('--config', type=str, default='config.json', help='Path to the configuration file.')
+    parser.add_argument('--num_images', type=int, default=5000, help='Number of images for evaluation.')
+    parser.add_argument('--output', type=str, default='evaluation_summary.csv', help='Path to save the output CSV file.')
+    args = parser.parse_args()
+    main(args)
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\evaluate_inversion.py ---
+# evaluate_inversion.py
+
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision.utils import save_image, make_grid
+from tqdm.auto import tqdm
+import os
+import json
+import argparse
+
+# 프로젝트 내부 모듈 임포트
+from acgan.model import ACGANGenerator, ACGANDiscriminator
+
+def load_models(g_path, d_path, config, dataset_name, device):
+    """생성자와 판별자 모델을 모두 로드합니다."""
+    d_config = config["dataset_configs"][dataset_name]
+    img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+
+    # 생성자 로드
+    generator = ACGANGenerator(
+        latent_dim=config["latent_dim"],
+        num_classes=config["num_classes"],
+        label_embedding_dim=config["label_embedding_dim_g"],
+        img_size=img_size,
+        img_channels=img_channels
+    ).to(device)
+    # 보안 경고를 해결하기 위해 weights_only=True 추가
+    g_state_dict = torch.load(g_path, map_location=device, weights_only=True)
+    new_g_state_dict = {k.replace('module.', ''): v for k, v in g_state_dict.items()}
+    generator.load_state_dict(new_g_state_dict)
+    generator.eval()
+
+    # 판별자 로드
+    discriminator = ACGANDiscriminator(
+        num_classes=config["num_classes"],
+        img_size=img_size,
+        img_channels=img_channels
+    ).to(device)
+    # 보안 경고를 해결하기 위해 weights_only=True 추가
+    d_state_dict = torch.load(d_path, map_location=device, weights_only=True)
+    new_d_state_dict = {k.replace('module.', ''): v for k, v in d_state_dict.items()}
+    discriminator.load_state_dict(new_d_state_dict)
+    discriminator.eval()
+    
+    return generator, discriminator
+
+# 
+# =============================================================
+#  핵심 수정 사항: 아래 @torch.no_grad() 줄을 삭제했습니다.
+# =============================================================
+# @torch.no_grad() <-- 이 줄을 삭제하세요.
+#
+def run_inversion_attack(generator, discriminator, target_class, config, device,
+                         steps=2000, lr=0.1, realness_weight=0.1):
+    """
+    최적화 기반 모델 역전 공격을 수행하여 한 클래스에 대한 대표 이미지를 생성합니다.
+    """
+    # 1. 최적화할 잠재 벡터 z 초기화
+    # requires_grad=True를 통해 이 텐서에 대한 그래디언트를 계산하도록 설정
+    z = torch.randn(1, config["latent_dim"], device=device, requires_grad=True)
+    
+    # z를 위한 옵티마이저 설정
+    optimizer = optim.Adam([z], lr=lr)
+    
+    # 공격 대상 레이블
+    target_label = torch.tensor([target_class], dtype=torch.long, device=device)
+
+    # 2. 최적화 루프
+    for _ in range(steps):
+        optimizer.zero_grad()
+        
+        # z로부터 이미지 생성 (이 과정은 그래디언트 흐름이 유지됨)
+        fake_image = generator(z, target_label)
+        
+        # 가이드 모델(판별자)로부터 점수 획득
+        # 판별자는 업데이트하지 않으므로, torch.no_grad() 컨텍스트 내에서 실행해도 되지만,
+        # 코드가 복잡해지므로 그냥 실행. 성능에 큰 영향 없음.
+        source_pred, class_pred = discriminator(fake_image)
+        
+        # 3. 손실 함수 정의: 클래스 점수와 진짜다움 점수를 최대화
+        class_scores = class_pred[:, target_class]
+        class_loss = -class_scores.mean() 
+        
+        realness_loss = -source_pred.mean()
+        
+        total_loss = class_loss + realness_weight * realness_loss
+        
+        # 4. z에 대해 역전파 및 업데이트
+        # total_loss가 z와 연결되어 있으므로 정상적으로 작동
+        total_loss.backward()
+        optimizer.step()
+
+    # 5. 최종 최적화된 z로 이미지 생성 후 반환
+    final_image = generator(z, target_label).detach()
+    return final_image
+
+def main(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+    
+    output_base_dir = "inversion_attack_results"
+    os.makedirs(output_base_dir, exist_ok=True)
+    
+    enabled_datasets = {k: v for k, v in config["dataset_configs"].items() if v["enabled"]}
+    
+    for dataset_name, d_config in tqdm(enabled_datasets.items(), desc="All Datasets"):
+        print(f"\n===== Starting Model Inversion for Dataset: {dataset_name} =====")
+        dataset_output_dir = os.path.join(output_base_dir, dataset_name)
+        os.makedirs(dataset_output_dir, exist_ok=True)
+        
+        model_types_to_evaluate = {
+            "Original": "Original",
+            "Retrain": "Baseline_Retrain",
+            "Finetune": "Baseline_Finetune",
+            **{f"Unlearn_s={s:.1f}": f"Unlearning_soft_target_{s:.1f}" for s in config["soft_label_target_list"]}
+        }
+        
+        for model_name, folder_name in tqdm(model_types_to_evaluate.items(), desc=f"Inverting {dataset_name} Models"):
+            
+            g_filename, d_filename = "generator.pth", "discriminator.pth"
+            if "Unlearn" in model_name:
+                soft_target = float(model_name.split('=')[-1])
+                g_filename = f"generator_final_soft_{soft_target:.1f}.pth"
+                d_filename = f"discriminator_final_soft_{soft_target:.1f}.pth"
+            
+            g_path = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/{folder_name}/models/{g_filename}"
+            d_path = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/{folder_name}/models/{d_filename}"
+            
+            if not (os.path.exists(g_path) and os.path.exists(d_path)):
+                continue
+
+            generator, discriminator = load_models(g_path, d_path, config, dataset_name, device)
+            
+            inverted_images = []
+            class_pbar = tqdm(range(config['num_classes']), desc=f"Inverting classes for {model_name}", leave=False)
+            for target_class in class_pbar:
+                inverted_image = run_inversion_attack(generator, discriminator, target_class, config, device)
+                inverted_images.append(inverted_image)
+            
+            if inverted_images:
+                grid = make_grid(torch.cat(inverted_images), nrow=config['num_classes'], normalize=True)
+                save_path = os.path.join(dataset_output_dir, f"inversion_{model_name.replace('=', '_')}.png")
+                save_image(grid, save_path)
+                print(f"  ✅ Saved inverted images grid to: {save_path}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Run Model Inversion Attack on trained ACGAN generators.")
+    parser.add_argument('--config', type=str, default='config.json', help='Path to the configuration file.')
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"Config file not found at: {args.config}")
+        
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+        
+    main(config)
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\evaluate_mia.py ---
+# evaluate_mia_targeted.py
+# (Measures Targeted MIA for Forget Set and Retain Set)
+
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split, Subset
+from sklearn.metrics import accuracy_score
+from sklearn.linear_model import LogisticRegression
+from tqdm.auto import tqdm
+import numpy as np
+import pandas as pd
+import os
+import json
+import argparse
+
+# --- 하이퍼파라미터 ---
+SHADOW_EPOCHS = 100
+
+# --- 프로젝트 내부 모듈 ---
+from acgan.model import ACGANGenerator, ACGANDiscriminator, EfficientGANLoss
+from acgan.dataset import get_dataloader
+
+# ===================================================================
+#  모델 로딩 및 공통 유틸리티
+# ===================================================================
+def load_models(g_path, d_path, config, dataset_name, device):
+    d_config = config["dataset_configs"][dataset_name]
+    img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+    generator = ACGANGenerator(latent_dim=config["latent_dim"], num_classes=config["num_classes"], label_embedding_dim=config["label_embedding_dim_g"], img_size=img_size, img_channels=img_channels).to(device)
+    if os.path.exists(g_path):
+        g_state_dict = torch.load(g_path, map_location=device, weights_only=True)
+        new_g_state_dict = {k.replace('module.', ''): v for k, v in g_state_dict.items()}
+        generator.load_state_dict(new_g_state_dict)
+    generator.eval()
+    discriminator = ACGANDiscriminator(num_classes=config["num_classes"], img_size=img_size, img_channels=img_channels).to(device)
+    if os.path.exists(d_path):
+        d_state_dict = torch.load(d_path, map_location=device, weights_only=True)
+        new_d_state_dict = {k.replace('module.', ''): v for k, v in d_state_dict.items()}
+        discriminator.load_state_dict(new_d_state_dict)
+    discriminator.eval()
+    return generator, discriminator
+
+# ===================================================================
+#  MIA 공격 함수
+# ===================================================================
+
+# =================== 추가된 함수 ===================
+@torch.no_grad()
+def get_discriminator_scores(discriminator, dataloader, device):
+    """화이트박스 공격을 위해 판별자의 신뢰도 점수를 계산합니다."""
+    scores = []
+    for images, _ in tqdm(dataloader, desc="[WB-DMIA] Getting Scores", leave=False):
+        images = images.to(device)
+        source_preds, _ = discriminator(images)
+        scores.append(torch.sigmoid(source_preds).cpu().numpy())
+    return np.concatenate(scores).flatten()
+# ===============================================
+
+def run_targeted_attack(scores, membership_labels, class_labels, forget_label):
+    """주어진 데이터 그룹(전체, Forget, Retain)에 대해 MIA 정확도를 계산합니다."""
+    forget_mask = (class_labels == forget_label)
+    forget_scores = scores[forget_mask]
+    forget_labels = membership_labels[forget_mask]
+    
+    retain_mask = (class_labels != forget_label)
+    retain_scores = scores[retain_mask]
+    retain_labels = membership_labels[retain_mask]
+    
+    def calculate_acc(sub_scores, sub_labels):
+        n_members = int(np.sum(sub_labels))
+        if n_members == 0 or len(sub_labels) == n_members: return 0.5
+        sorted_indices = np.argsort(-sub_scores)
+        predictions = np.zeros_like(sub_labels, dtype=int)
+        predictions[sorted_indices[:n_members]] = 1
+        return accuracy_score(sub_labels, predictions)
+
+    acc_overall = calculate_acc(scores, membership_labels)
+    acc_forget = calculate_acc(forget_scores, forget_labels)
+    acc_retain = calculate_acc(retain_scores, retain_labels)
+    
+    return acc_overall, acc_forget, acc_retain
+
+# ===================================================================
+#  블랙박스 공격 (섀도우 모델링)
+# ===================================================================
+def train_shadow_model(shadow_train_loader, config, dataset_name, device):
+    print(f"\n--- [Black-box] Training Shadow Model for {SHADOW_EPOCHS} epochs ---")
+    d_config = config["dataset_configs"][dataset_name]; img_size, img_channels = d_config["img_size"], d_config["img_channels"]
+    shadow_generator = ACGANGenerator(config["latent_dim"], config["num_classes"], config["label_embedding_dim_g"], img_size, img_channels).to(device)
+    shadow_discriminator = ACGANDiscriminator(config["num_classes"], img_size, img_channels).to(device)
+    gan_loss_fn = EfficientGANLoss().to(device); aux_criterion = nn.CrossEntropyLoss().to(device)
+    g_optimizer = optim.Adam(shadow_generator.parameters(), lr=config["lr_g"], betas=(0.5, 0.999))
+    d_optimizer = optim.Adam(shadow_discriminator.parameters(), lr=config["lr_d"], betas=(0.5, 0.999))
+    epoch_pbar = tqdm(range(SHADOW_EPOCHS), desc="[BB] Shadow Training", leave=False)
+    for epoch in epoch_pbar:
+        for real_imgs, labels in shadow_train_loader:
+            real_imgs, labels, batch_size = real_imgs.to(device), labels.to(device), real_imgs.size(0)
+            d_optimizer.zero_grad()
+            real_src_pred, real_cls_pred = shadow_discriminator(real_imgs)
+            z_d = torch.randn(batch_size, config["latent_dim"], device=device); gen_labels_d = torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            with torch.no_grad(): fake_imgs = shadow_generator(z_d, gen_labels_d)
+            fake_src_pred, fake_cls_pred = shadow_discriminator(fake_imgs)
+            d_loss_gan = gan_loss_fn.discriminator_loss(real_src_pred, fake_src_pred); d_loss_aux = aux_criterion(real_cls_pred, labels) + aux_criterion(fake_cls_pred, gen_labels_d); d_loss = d_loss_gan + config["aux_loss_weight"] * d_loss_aux
+            d_loss.backward(); d_optimizer.step()
+            g_optimizer.zero_grad()
+            z_g, gen_labels_g = torch.randn(batch_size, config["latent_dim"], device=device), torch.randint(0, config["num_classes"], (batch_size,), device=device)
+            gen_imgs_g = shadow_generator(z_g, gen_labels_g); g_src_output, g_cls_output = shadow_discriminator(gen_imgs_g)
+            g_loss_gan = gan_loss_fn.generator_loss(g_src_output); g_loss_aux = aux_criterion(g_cls_output, gen_labels_g); g_loss = g_loss_gan + config["aux_loss_weight"] * g_loss_aux
+            g_loss.backward(); g_optimizer.step()
+    shadow_discriminator.eval()
+    return shadow_discriminator
+
+@torch.no_grad()
+def extract_attack_features_and_labels(discriminator, dataloader, device):
+    all_features = []; all_class_labels = []
+    for images, labels in tqdm(dataloader, desc="[BB] Extracting Features", leave=False):
+        images = images.to(device)
+        _, class_preds = discriminator(images)
+        features = F.softmax(class_preds, dim=1).cpu().numpy()
+        all_features.append(features)
+        all_class_labels.append(labels.cpu().numpy())
+    return np.concatenate(all_features), np.concatenate(all_class_labels)
+
+def train_attack_model(shadow_discriminator, shadow_train_loader, shadow_test_loader, device):
+    print("--- [Black-box] Training Attack Model ---")
+    member_features, _ = extract_attack_features_and_labels(shadow_discriminator, shadow_train_loader, device)
+    non_member_features, _ = extract_attack_features_and_labels(shadow_discriminator, shadow_test_loader, device)
+    X_attack = np.concatenate([member_features, non_member_features])
+    y_attack = np.concatenate([np.ones(len(member_features)), np.zeros(len(non_member_features))])
+    attack_model = LogisticRegression(solver='liblinear', class_weight='balanced')
+    attack_model.fit(X_attack, y_attack)
+    print("--- [Black-box] Attack Model is Ready ---")
+    return attack_model
+
+# ===================================================================
+#  메인 실행 로직
+# ===================================================================
+def main(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+    results = []
+    enabled_datasets = {k: v for k, v in config["dataset_configs"].items() if v["enabled"]}
+    
+    for dataset_name, d_config in tqdm(enabled_datasets.items(), desc="All Datasets"):
+        print(f"\n===== Targeted MIA Evaluation for Dataset: {dataset_name} =====")
+        
+        temp_config = config.copy(); temp_config['rank'] = -1
+        full_train_ds = get_dataloader(dataset_name, train=True, **temp_config)[0].dataset
+        full_test_ds = get_dataloader(dataset_name, train=False, **temp_config)[0].dataset
+        
+        target_train_indices, shadow_train_indices = random_split(range(len(full_train_ds)), [len(full_train_ds)//2, len(full_train_ds) - len(full_train_ds)//2])
+        target_test_indices, shadow_test_indices = random_split(range(len(full_test_ds)), [len(full_test_ds)//2, len(full_test_ds) - len(full_test_ds)//2])
+        
+        target_train_set = Subset(full_train_ds, target_train_indices); target_test_set = Subset(full_test_ds, target_test_indices)
+        shadow_train_set = Subset(full_train_ds, shadow_train_indices); shadow_test_set = Subset(full_test_ds, shadow_test_indices)
+        target_train_loader = DataLoader(target_train_set, batch_size=config['batch_size']); target_test_loader = DataLoader(target_test_set, batch_size=config['batch_size'])
+        shadow_train_loader = DataLoader(shadow_train_set, batch_size=config['batch_size']); shadow_test_loader = DataLoader(shadow_test_set, batch_size=config['batch_size'])
+        
+        shadow_discriminator = train_shadow_model(shadow_train_loader, config, dataset_name, device)
+        bb_attack_model = train_attack_model(shadow_discriminator, shadow_train_loader, shadow_test_loader, device)
+
+        model_types_to_evaluate = {
+            "Original": "Original", "Retrain": "Baseline_Retrain", "Finetune": "Baseline_Finetune",
+            **{f"Unlearn_s={s:.1f}": f"Unlearning_soft_target_{s:.1f}" for s in config["soft_label_target_list"]}
+        }
+        for model_name, folder_name in tqdm(model_types_to_evaluate.items(), desc=f"Attacking {dataset_name} Models"):
+            d_path = f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/{folder_name}/models/discriminator_final_soft_{float(model_name.split('=')[-1]):.1f}.pth" if "Unlearn" in model_name else f"outputs/ACGAN(self_attention+residual_block+hinge_loss)/{dataset_name}/{folder_name}/models/discriminator.pth"
+            if not os.path.exists(d_path): continue
+            
+            _, discriminator = load_models("", d_path, config, dataset_name, device)
+            
+            member_scores = get_discriminator_scores(discriminator, target_train_loader, device)
+            non_member_scores = get_discriminator_scores(discriminator, target_test_loader, device)
+            wb_scores = np.concatenate([member_scores, non_member_scores])
+            member_features, member_class_labels = extract_attack_features_and_labels(discriminator, target_train_loader, device)
+            non_member_features, non_member_class_labels = extract_attack_features_and_labels(discriminator, target_test_loader, device)
+            bb_features = np.concatenate([member_features, non_member_features])
+            membership_labels = np.concatenate([np.ones_like(member_scores), np.zeros_like(non_member_scores)])
+            class_labels = np.concatenate([member_class_labels, non_member_class_labels])
+            
+            _, wb_acc_forget, wb_acc_retain = run_targeted_attack(wb_scores, membership_labels, class_labels, config["forget_label"])
+            
+            bb_scores_from_preds = bb_attack_model.predict_proba(bb_features)[:, 1]
+            _, bb_acc_forget, bb_acc_retain = run_targeted_attack(bb_scores_from_preds, membership_labels, class_labels, config["forget_label"])
+
+            print(f"  - [{model_name}] WB-DMIA (Forget/Retain): {wb_acc_forget:.4f} / {wb_acc_retain:.4f} | BB-DMIA (Forget/Retain): {bb_acc_forget:.4f} / {bb_acc_retain:.4f}")
+            results.append({
+                "dataset": dataset_name, "model_type": model_name,
+                "wb_acc_forget": wb_acc_forget, "wb_acc_retain": wb_acc_retain,
+                "bb_acc_forget": bb_acc_forget, "bb_acc_retain": bb_acc_retain
+            })
+    
+    if results:
+        results_df = pd.DataFrame(results)
+        print("\n\n===== Final Targeted MIA Results ====="); print(results_df.to_string())
+        results_df.to_csv("mia_evaluation_results_targeted.csv", index=False)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Run Targeted (Forget/Retain Set) MIA."); parser.add_argument('--config', type=str, default='config.json', help='Path to the configuration file.')
+    args = parser.parse_args()
+    if not os.path.exists(args.config): raise FileNotFoundError(f"Config file not found at: {args.config}")
+    with open(args.config, 'r') as f: config = json.load(f)
+    main(config)
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\README.md ---
+---
+
+# ✨ ACGAN 기반의 선택적 데이터 언러닝(Unlearning)
+
+본 프로젝트는 **ACGAN (Auxiliary Classifier Generative Adversarial Network)** 모델에 **머신 언러닝(Machine Unlearning)** 기술을 적용하여, 특정 클래스(레이블)의 데이터를 학습된 모델에서 선택적으로 제거하는 과정을 구현합니다.
+
+## 1. 주요 특징 (Key Features)
+
+*   **포괄적인 실험 설계**: 제안하는 언러닝 방법론뿐만 아니라, 성능 비교를 위한 두 가지 핵심 **베이스라인(Retrain, Finetune)**을 포함합니다.
+*   **유연한 실행 환경**: Single-GPU (`python train.py`)와 Multi-GPU (`torchrun ...`) 환경을 모두 지원합니다.
+*   **고성능 모델 아키텍처**: Self-Attention, Residual Block, Spectral Normalization, Hinge Loss 등 최신 GAN 기술을 적용했습니다.
+*   **상세한 로깅 및 평가**:
+    *   **[수정된 부분]** 모든 학습 단계(Original, Baselines, Unlearning)의 **실행 시간**을 자동으로 측정하고, 최종 결과를 `execution_times.csv` 파일로 종합하여 각 방법론의 효율성을 명확하게 비교할 수 있습니다.
+    *   TensorBoard를 통해 모든 실험의 손실 및 이미지 생성을 실시간으로 모니터링합니다.
+    *   `evaluate_all.py` 스크립트로 모든 실험의 **성능 지표(FID, IS 등)**를 종합하여 `evaluation_summary.csv` 파일로 자동 저장합니다.
+    *   **[수정된 부분]** **멤버십 추론 공격 (MIA)** 및 **모델 역전 공격 (Model Inversion Attack)** 평가 스크립트를 포함하여 망각 성능을 다각도로 검증합니다.
+
+## 2. 프로젝트 구조 (Project Structure)
+
+**[수정된 부분]** 실제 코드의 출력 경로와 평가 스크립트 구성을 정확하게 반영했습니다.
+
+```
+acgan_unlearning_project/
+│
+├── outputs/
+│   ├── ACGAN(self_attention+residual_block+hinge_loss)/
+│   │   ├── [Dataset_Name]/
+│   │   │   ├── Original/            # Stage 1-1 결과
+│   │   │   ├── Baseline_Retrain/    # 베이스라인(재학습) 결과
+│   │   │   ├── Baseline_Finetune/   # 베이스라인(미세조정) 결과
+│   │   │   └── Unlearning_soft.../  # Stage 1-2, 2 결과
+│
+├── inversion_attack_results/      # [자동 생성] 모델 역전 공격 결과 이미지
+│
+├── acgan/
+│   ├── trainer.py             # 모든 학습(Stage, Baseline) 로직
+│   └── ...
+│
+├── train.py                   # 실험을 시작하는 메인 실행 스크립트
+├── evaluate_all.py            # 모든 실험 결과를 종합 평가
+├── evaluate_mia.py            # [수정] 타겟화된(Forget/Retain) MIA 평가
+├── evaluate_inversion.py      # [추가] 모델 역전 공격 평가
+├── execution_times.csv        # [자동 생성] 모든 학습 시간 요약 결과
+├── evaluation_summary.csv     # [자동 생성] 모든 성능 평가 요약 결과
+├── mia_evaluation_results_targeted.csv # [자동 생성] MIA 평가 결과
+├── config.json                # 모든 하이퍼파라미터 관리
+└── README.md                  # 프로젝트 설명서
+```
+
+## 3. 실행 환경 설정 (Setup)
+
+### 3.1. 사전 요구사항
+
+*   Python 3.8 이상
+*   NVIDIA GPU 및 CUDA 11.x 이상
+
+### 3.2. 설치 (Installation)
+
+1.  **프로젝트 클론**
+    ```bash
+    git clone <저장소_URL>
+    cd acgan_unlearning_project
+    ```
+
+2.  **필요 라이브러리 설치**
+    PyTorch는 사용자의 CUDA 버전에 맞게 설치하는 것을 권장합니다. (공식 홈페이지: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/))
+
+    ```bash
+    # 나머지 의존성 라이브러리 설치
+    pip install -r requirements.txt
+    ```
+
+## 4. 모델 학습 및 언러닝 (Training and Unlearning)
+
+### 4.1. `config.json` 설정하기
+
+모든 실험의 하이퍼파라미터는 `config.json` 파일에서 관리됩니다. 학습을 시작하기 전에 이 파일을 열어 원하는 설정을 구성하세요.
+
+*   `dataset_configs`: 학습에 사용할 데이터셋의 `enabled` 값을 `true`로 설정합니다.
+*   `forget_label`: 모델에서 잊게 할 클래스(레이블)를 지정합니다.
+*   `original_epochs`, `step1_epochs`, `step2_epochs`: 각 단계별 학습 에폭 수를 조절합니다.
+*   `run_*_flag`: 특정 학습 단계(Stage, Baseline)의 실행 여부를 `true` 또는 `false`로 제어합니다.
+
+### 4.2. 학습 실행
+
+터미널에서 프로젝트의 최상위 폴더로 이동한 후, 아래 명령어 중 하나를 실행하여 학습을 시작합니다.
+
+#### **Single-GPU 환경**
+
+GPU가 하나인 환경에서는 간단하게 `python` 명령어를 사용합니다.
+
+```bash
+python train.py
+```
+
+#### **Multi-GPU 환경 (DDP)**
+
+사용 가능한 GPU가 여러 개인 경우, `torchrun`을 사용하여 분산 학습(DDP, Distributed Data Parallel)을 실행하면 학습 속도를 크게 향상시킬 수 있습니다.
+
+*   `--nproc_per_node`: 사용할 GPU의 개수를 지정합니다.
+
+**예시 (GPU 2개 사용):**
+```bash
+torchrun --standalone --nproc_per_node=2 train.py
+```
+
+> **💡 참고**: 학습이 시작되면 `config.json`에 설정된 플래그(`run_*_flag`)에 따라 모든 단계가 순차적으로 자동 실행됩니다. 모든 학습이 완료되면 프로젝트 루트에 `execution_times.csv` 파일이 자동으로 생성됩니다.
+
+### 4.3. 실험 단계별 설명 (Experiment Stage Details)
+
+본 프로젝트는 제안하는 언러닝 방법론의 성능을 객관적으로 검증하기 위해, **두 가지 베이스라인(Baseline) 실험**과 **세 단계의 언러닝(Unlearning) 실험**으로 구성됩니다.
+
+---
+
+#### **비교 기준이 되는 베이스라인 모델 (Baseline Models)**
+
+##### **1. 원본 모델 (Original Model)**
+*   **목표**: 모든 비교의 출발점이 되는, 모든 클래스를 완벽하게 학습한 고성능 모델을 생성합니다.
+*   **학습 데이터**: 전체 데이터셋
+*   **핵심 동작**: 표준 ACGAN 학습을 `original_epochs` 동안 진행합니다.
+*   **의미**: 이 모델의 성능이 언러닝 후에도 최대한 보존되어야 할 '기억'의 총량입니다.
+
+##### **2. 재학습 모델 (Retrain from Scratch Baseline)**
+*   **목표**: 언러닝 성능의 "이상적인 목표(Gold Standard)". 즉, 잊어야 할 데이터를 처음부터 아예 보지 않은 모델의 성능을 측정합니다.
+*   **학습 데이터**: `forget_label`을 제외한 데이터셋
+*   **핵심 동작**: 제외된 데이터셋으로 모델을 처음부터 `original_epochs` 동안 재학습시킵니다.
+*   **의미**: 언러닝된 모델의 성능은 이 재학습 모델의 성능에 가까워야 하며, 언러닝 시간은 재학습 시간보다 훨씬 짧아야 합니다.
+
+##### **3. 미세조정 모델 (Finetune Baseline)**
+*   **목표**: 가장 간단하고 직관적인 언러닝 방법과의 성능을 비교합니다.
+*   **학습 데이터**: `forget_label`을 제외한 데이터셋
+*   **핵심 동작**: **원본 모델(Original Model)**을 불러와, 제외된 데이터셋으로 짧은 `finetune_epochs` 동안 추가 학습(미세조정)을 진행합니다.
+*   **의미**: 이 방법은 `forget_label`을 빠르게 잊지만, 나머지 클래스에 대한 지식도 함께 손상(Catastrophic Forgetting)될 가능성이 높습니다. 제안하는 언러닝 방법이 이 미세조정 방법보다 나머지 클래스의 성능을 더 잘 보존함을 보여주는 것이 중요합니다.
+
+---
+
+#### **제안하는 2단계 언러닝 방법론 (Proposed 2-Stage Unlearning)**
+
+##### **Stage 1-2: 판별자 소프트 망각 (Discriminator Soft Forgetting)**
+*   **목표**: 생성자의 품질은 유지하면서, 판별자(Discriminator)가 '잊어야 할 클래스'(`forget_label`)에 대한 판단력을 의도적으로 흐리게 만듭니다.
+*   **핵심 동작**:
+    *   판별자는 `forget_label`의 진짜 이미지를 봤을 때, `soft_label_target` 값에 따라 이를 '진짜' 또는 '가짜'로 취급하도록 특수한 손실 함수로 학습됩니다.
+    *   생성자는 이 단계에서 일반적인 ACGAN 손실 함수로 학습하여 전체적인 이미지 생성 품질을 유지하고 판별자 학습을 돕는 "스파링 파트너" 역할을 합니다.
+*   **[수정된 부분] 결과물**: 특정 클래스를 잘 구분하지 못하게 된 `discriminator_step1.pth`와 학습 중간 결과물인 `generator_step1.pth`.
+
+##### **Stage 2: 생성자/판별자 최종 미세 조정 (Final Fine-tuning)**
+*   **목표**: '흐려진' 판별자의 가이드를 받아, 생성자(Generator)가 더 이상 `forget_label`의 이미지를 생성하지 않도록 최종적으로 학습을 완료합니다.
+*   **핵심 동작**:
+    *   **입력**: Stage 1-1의 **원본 생성자**와 Stage 1-2의 **'혼란스러운' 판별자**를 가져와 학습을 시작합니다.
+    *   **생성자**: `forget_label`의 이미지를 생성하려고 시도할 때 추가적인 페널티(손실 가중치 `beta`)를 받습니다. 이는 생성자가 해당 클래스의 이미지 생성을 회피하도록 만듭니다.
+    *   **판별자**: Stage 1-2와 동일한 '소프트 망각' 손실 함수를 계속 사용하며 학습을 이어갑니다.
+*   **[수정된 부분] 결과물**: 최종적으로 언러닝이 완료된 `generator_final_soft_{...}.pth`와 `discriminator_final_soft_{...}.pth`.
+
+## 5. 학습 과정 모니터링 (Monitoring with TensorBoard) 📈
+
+학습 과정 중 생성되는 손실(Loss) 그래프와 이미지 샘플을 실시간으로 확인하려면 TensorBoard를 사용할 수 있습니다.
+
+1.  새 터미널에서 프로젝트의 최상위 폴더로 이동한 후, 아래 명령어를 실행하여 TensorBoard 서버를 시작합니다.
+    ```bash
+    tensorboard --logdir outputs/ --port 6006
+    ```
+2.  웹 브라우저를 열고, `http://localhost:6006` 주소로 접속하면 실시간으로 업데이트되는 대시보드를 확인할 수 있습니다.
+
+> #### 💡 **TensorBoard 활용 팁**
+>
+> 이제 **모든 학습 단계(Original, Baselines, Stage 1-2, Stage 2)의 손실과 생성 이미지가 TensorBoard에 기록**됩니다. 이를 통해 다음과 같은 다양한 비교 분석이 가능합니다.
+>
+> *   **학습 단계별 비교**: 특정 `soft_target` 값에 대한 Stage 1-2와 Stage 2의 학습 안정성 비교
+> *   **언러닝 강도별 비교**: 서로 다른 `soft_target` 값(예: 0.1 vs 0.9)에 따른 Stage 2의 최종 성능 비교
+
+## 6. 모델 평가 (Evaluating the Model) 📊
+
+학습된 모델의 평가는 **성능(Performance)**, **효율성(Efficiency)**, **망각 성능(Forgetting)** 세 가지 측면에서 이루어집니다.
+
+### 6.1. 단일 모델 성능 평가 (`evaluate.py`)
+
+특정 실험 타입과 파라미터를 지정하여 성능(FID, IS 등)을 빠르게 확인하고 싶을 때 사용합니다.
+
+**실행 명령어 형식:**
+```bash
+# 기본/베이스라인 모델 평가
+python evaluate.py --dataset [데이터셋] --type [original|retrain|finetune]
+
+# 언러닝 모델 평가 (Stage 2 최종 결과)
+python evaluate.py --dataset [데이터셋] --type unlearning_final --soft_target [값]
+```
+
+### 6.2. 전체 모델 성능 종합 평가 (`evaluate_all.py`)
+
+`outputs` 폴더에 저장된 **모든 실험 결과**를 자동으로 찾아 한 번에 **성능**을 평가하고, 결과를 분석하기 쉬운 `evaluation_summary.csv` 파일로 저장합니다.
+
+**실행 명령어:**
+```bash
+python evaluate_all.py
+```
+
+### 6.3. [수정] 전체 학습 시간 종합 평가 (`train.py` 실행 시 자동 생성)
+
+`train.py` 스크립트는 각 실험 단계가 완료될 때마다 소요 시간을 자동으로 측정합니다. 모든 학습이 정상적으로 종료되면, 프로젝트 최상위 폴더에 `execution_times.csv` 파일이 생성됩니다. 이 파일에는 각 실험에 걸린 시간이 초 단위로 기록되어 있어, 제안하는 언러닝 방법론이 'Retrain' 베이스라인에 비해 얼마나 **효율적**인지 정량적으로 비교할 수 있습니다.
+
+**생성되는 `execution_times.csv` 파일 예시:**
+| dataset | stage | soft_target | gpus | execution_time_seconds |
+| :--- | :--- | :--- | :--- | :--- |
+| SVHN | Original | N/A | 1 | 3621.45 |
+| SVHN | Baseline_Retrain | N/A | 1 | 3580.12 |
+| SVHN | Baseline_Finetune | N/A | 1 | 895.50 |
+| SVHN | Unlearning_Stage1_2 | 0.0 | 1 | 3605.88 |
+| SVHN | Unlearning_Stage2 | 0.0 | 1 | 901.23 |
+| ... | ... | ... | ... | ... |
+
+### 6.4. [수정] 타겟화된 멤버십 추론 공격(MIA) 망각 성능 평가 (`evaluate_mia.py`)
+
+이 평가는 모델이 특정 데이터(Forget Set)를 얼마나 잘 "잊었는지"를 측정합니다. **Forget Set (잊어야 할 데이터 그룹)**과 **Retain Set (기억해야 할 데이터 그룹)** 각각에 대해 MIA 공격을 수행하여, 모델이 두 그룹의 데이터를 얼마나 다르게 취급하는지 정확도로 나타냅니다.
+
+*   **White-Box(WB) MIA**: 모델의 판별자 점수를 직접 활용하여 공격합니다.
+*   **Black-Box(BB) MIA**: 섀도우 모델링 기법을 사용하여 공격합니다.
+
+**실행 명령어:**
+스크립트를 실행하면 `config.json`에 활성화된 모든 데이터셋에 대해 모든 모델 타입의 망각 성능을 평가하고, `mia_evaluation_results_targeted.csv` 파일에 결과를 저장합니다.
+```bash
+python evaluate_mia.py
+```
+
+**결과 해석:**
+공격 정확도(`wb_acc_forget`, `bb_acc_forget` 등)가 **0.5 (50%)에 가까울수록** 모델이 해당 데이터 그룹의 멤버십 정보를 노출하지 않아 망각 성능이 우수함을 의미합니다. `Retrain` 모델의 점수가 가장 이상적인 목표치입니다.
+
+### 6.5. [추가] 모델 역전 공격(Model Inversion Attack) 평가 (`evaluate_inversion.py`)
+
+모델 역전 공격은 학습된 모델(특히 판별자)을 이용하여 각 클래스를 대표하는 이미지를 복원하는 기법입니다. 이를 통해 모델이 특정 클래스에 대해 어떤 정보를 "기억"하고 있는지 시각적으로 확인할 수 있습니다. 언러닝이 성공적으로 수행되었다면, `forget_label`에 해당하는 복원 이미지는 품질이 낮거나 알아볼 수 없게 나타나야 합니다.
+
+**실행 명령어:**
+스크립트를 실행하면 모든 모델에 대해 각 클래스별 대표 이미지를 생성하고 `inversion_attack_results/[데이터셋]` 폴더에 그리드 이미지로 저장합니다.
+```bash
+python evaluate_inversion.py
+```
+
+**결과 확인:**
+생성된 `inversion_attack_results/` 폴더 안의 이미지들을 열어 `Original` 모델과 `Unlearning_Final` 모델의 `forget_label`에 해당하는 이미지를 시각적으로 비교하여 망각 성능을 정성적으로 평가할 수 있습니다.
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\requirements.txt ---
+# =================================================================
+#  Core Deep Learning Framework
+# =================================================================
+# torch, torchvision, torchaudio는 사용자의 CUDA 버전에 맞게
+# 별도로 설치하는 것을 권장합니다. (아래 버전은 cu118 기준)
+torch==2.4.1+cu118
+torchvision==0.19.1+cu118
+torchaudio==2.4.1+cu118
+numpy==1.24.1
+
+# =================================================================
+#  Model Evaluation & Metrics
+# =================================================================
+# IS, FID, KID 등 정량적 평가 지표 계산을 위한 라이브러리
+torchmetrics==1.5.2
+scipy==1.10.1  # Inception Score 계산에 torchmetrics가 의존함
+torch-fidelity==0.3.0 # InceptionScore, FID, KID 계산에 필요
+
+# =================================================================
+#  Monitoring & Visualization
+# =================================================================
+# 학습 과정 모니터링 (손실 그래프 등)
+tensorboard==2.14.0
+# 유틸리티 스크립트에서 시각화에 사용될 수 있음
+matplotlib==3.7.5
+
+# =================================================================
+#  Utilities
+# =================================================================
+# 터미널에 진행률 바(Progress Bar) 표시
+tqdm==4.67.1
+# 이미지 로딩 및 처리를 위한 라이브러리
+Pillow==10.2.0
+
+
+--- File: C:\Users\USER\Desktop\byeongcheon\github_repositories\01_ACGAN_unlearning_project(multi_gpu)\train.py ---
+# train.py
+
+import torch
+import torch.distributed as dist
+from tqdm.auto import tqdm
+import os
+import json
+import csv # 💡 CSV 저장을 위한 라이브러리 임포트
+
+from acgan.dataset import get_dataloader
+from acgan.trainer import run_stage1_1, run_stage1_2, run_stage2, run_baseline_retrain, run_baseline_finetune
+
+def setup_ddp():
+    """DDP를 위한 프로세스 그룹을 초기화합니다."""
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    # 💡 DDP 버그가 해결되었으므로, 원래의 안정적인 file-based 초기화 방식을 사용합니다.
+    sync_file_path = os.path.abspath("ddp_sync_file")
+    path_for_uri = sync_file_path.replace('\\', '/')
+    sync_file_uri = f"file:///{path_for_uri}"
+    dist.init_process_group(
+        backend="gloo", # Windows에서는 'gloo' 사용
+        init_method=sync_file_uri,
+        rank=rank,
+        world_size=world_size
+    )
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, sync_file_path
+
+def cleanup_ddp(rank, sync_file_path):
+    """DDP 프로세스 그룹을 정리하고 공유 파일을 삭제합니다."""
+    if rank == 0 and os.path.exists(sync_file_path):
+        os.remove(sync_file_path)
+    dist.destroy_process_group()
+
+
+def main_worker(rank, world_size, config):
+    """(Single-GPU와 DDP 모두에서) 각 프로세스에서 실행될 메인 학습 함수입니다."""
+    if world_size > 1:
+        device = torch.device(f"cuda:{rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if rank == 0:
+        if world_size > 1:
+            print(f"DDP-Worker: Running on {world_size} GPUs using 'gloo' backend.")
+        else:
+            print(f"Single-GPU Mode: Running on device: {device}")
+        
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+    
+    # 💡 실행 시간 기록을 위한 리스트 초기화 (rank 0에서만 관리)
+    timing_results = []
+
+    enabled_datasets = {k: v for k, v in config["dataset_configs"].items() if v["enabled"]}
+    dataset_pbar = tqdm(enabled_datasets.items(), desc="Overall Progress", position=0, disable=(rank != 0))
+
+    for dataset_name, dataset_config in dataset_pbar:
+        if rank == 0:
+            dataset_pbar.set_description(f"Processing Dataset: {dataset_name}")
+        
+        config["current_dataset_name"] = dataset_name
+        
+        fixed_noise = torch.randn(config["num_classes"] * 10, config["latent_dim"], device=device)
+        fixed_labels = torch.tensor([i for i in range(config["num_classes"]) for _ in range(10)], dtype=torch.long, device=device)
+        
+        # --- Stage 1-1 (Original Model) ---
+        if config["run_stage1_1_flag"]:
+            full_dataloader, full_sampler = get_dataloader(
+                dataset_name=dataset_name, img_size=dataset_config["img_size"],
+                img_channels=dataset_config["img_channels"], batch_size=config["batch_size"],
+                world_size=world_size, rank=rank
+            )
+            # 💡 elapsed_time 변수로 소요 시간을 받음
+            elapsed_time = run_stage1_1(config, full_dataloader, full_sampler, rank, world_size, device, fixed_noise, fixed_labels)
+            
+            # 💡 rank 0 프로세스만 시간 기록
+            if rank == 0 and elapsed_time > 0:
+                timing_results.append({
+                    "dataset": dataset_name, "stage": "Original", "soft_target": "N/A", 
+                    "gpus": world_size, "execution_time_seconds": round(elapsed_time, 2)
+                })
+        else:
+            if rank == 0: print(f"\n--- Stage 1-1: {dataset_name} Original ACGAN 훈련 SKIPPED ---")
+
+        # --- Baseline Experiments (Retrain & Finetune) ---
+        if config.get("run_baseline_retrain_flag", False) or config.get("run_baseline_finetune_flag", False):
+            if rank == 0: print("\n--- Baseline 실험 준비 중 ---")
+            baseline_dataloader, baseline_sampler = get_dataloader(
+                dataset_name=dataset_name, img_size=dataset_config["img_size"],
+                img_channels=dataset_config["img_channels"], batch_size=config["batch_size"],
+                world_size=world_size, rank=rank, exclude_label=config["forget_label"]
+            )
+            if config.get("run_baseline_retrain_flag", False):
+                elapsed_time = run_baseline_retrain(config, baseline_dataloader, baseline_sampler, rank, world_size, device, fixed_noise, fixed_labels)
+                if rank == 0 and elapsed_time > 0:
+                    timing_results.append({
+                        "dataset": dataset_name, "stage": "Baseline_Retrain", "soft_target": "N/A",
+                        "gpus": world_size, "execution_time_seconds": round(elapsed_time, 2)
+                    })
+            
+            if config.get("run_baseline_finetune_flag", False):
+                elapsed_time = run_baseline_finetune(config, baseline_dataloader, baseline_sampler, rank, world_size, device, fixed_noise, fixed_labels)
+                if rank == 0 and elapsed_time > 0:
+                    timing_results.append({
+                        "dataset": dataset_name, "stage": "Baseline_Finetune", "soft_target": "N/A",
+                        "gpus": world_size, "execution_time_seconds": round(elapsed_time, 2)
+                    })
+
+        # --- Unlearning Experiments ---
+        full_dataloader_unlearn, full_sampler_unlearn = get_dataloader(
+            dataset_name=dataset_name, img_size=dataset_config["img_size"],
+            img_channels=dataset_config["img_channels"], batch_size=config["batch_size"],
+            world_size=world_size, rank=rank
+        )
+        
+        soft_label_pbar = tqdm(
+            config["soft_label_target_list"],
+            desc=f"[{dataset_name}] Soft Label Sweep",
+            position=1, leave=False, disable=(rank != 0)
+        )
+        for soft_label_target_val in soft_label_pbar:
+            if rank == 0:
+                soft_label_pbar.set_description(f"[{dataset_name}] Sweeping soft_target={soft_label_target_val:.2f}")
+
+            if config["run_stage1_2_flag"]:
+                elapsed_time = run_stage1_2(config, full_dataloader_unlearn, full_sampler_unlearn, soft_label_target_val, rank, world_size, device, fixed_noise, fixed_labels)
+                if rank == 0 and elapsed_time > 0:
+                    timing_results.append({
+                        "dataset": dataset_name, "stage": "Unlearning_Stage1_2", "soft_target": soft_label_target_val,
+                        "gpus": world_size, "execution_time_seconds": round(elapsed_time, 2)
+                    })
+            
+            if config["run_stage2_flag"]:
+                elapsed_time = run_stage2(config, full_dataloader_unlearn, full_sampler_unlearn, soft_label_target_val, rank, world_size, device, fixed_noise, fixed_labels)
+                if rank == 0 and elapsed_time > 0:
+                    timing_results.append({
+                        "dataset": dataset_name, "stage": "Unlearning_Stage2", "soft_target": soft_label_target_val,
+                        "gpus": world_size, "execution_time_seconds": round(elapsed_time, 2)
+                    })
+                
+        if rank == 0: print(f"\n===== {dataset_name} 데이터셋 모든 실험 완료 =====")
+
+    if rank == 0:
+        print("\n===== 모든 데이터셋 실험 완료 =====")
+        # 💡 모든 실험 완료 후, 기록된 소요 시간을 CSV 파일에 저장
+        if timing_results:
+            csv_file = 'execution_times.csv'
+            file_exists = os.path.isfile(csv_file)
+            try:
+                with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                    fieldnames = ["dataset", "stage", "soft_target", "gpus", "execution_time_seconds"]
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    
+                    if not file_exists:
+                        writer.writeheader()
+                        
+                    writer.writerows(timing_results)
+                print(f"\n✅ Execution times appended to '{csv_file}'")
+            except IOError as e:
+                print(f"Error: Could not write execution times to '{csv_file}'. Details: {e}")
+
+
+if __name__ == '__main__':
+    config_path = 'config.json'
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at: {config_path}")
+        
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    is_ddp = 'WORLD_SIZE' in os.environ
+    
+    if is_ddp:
+        rank, world_size, sync_file = setup_ddp()
+        main_worker(rank, world_size, config)
+        cleanup_ddp(rank, sync_file)
+    else:
+        main_worker(rank=0, world_size=1, config=config)
+
+
